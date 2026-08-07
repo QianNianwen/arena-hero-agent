@@ -34,6 +34,7 @@ from arena_hero import (
     TransportError,
     Turn,
     UnitType,
+    unit_cost,
 )
 
 API_KEY_ENV = "ARENA_HERO_API_KEY"
@@ -41,22 +42,22 @@ DEFAULT_BASE_URL = "https://api.arenahero.io"
 DEFAULT_COMPATIBILITY_MARKER = Path(
     "/var/lib/arena-hero-version/compatibility-hold.json"
 )
-DEFAULT_WORKER_TARGET = 12
+DEFAULT_WORKER_TARGET = 23
 DEFAULT_BEACON_POLICY = "retreat"
 BASE_WORKER_TARGET = 6
 CORE_RESOURCE_RESERVE = 10
-WORKER_EXPANSION_COST = 5
 LATE_EXPANSION_RESERVE = 15
 EARLY_DEFENSE_WORKER_GOAL = 8
 EARLY_DEFENSE_RESERVE = 15
 LONG_TERM_DEFENSE_RESERVE = 15
-VANGUARD_COST = 10
-RANGER_COST = 12
 EARLY_DEFENSE_VANGUARD_TARGET = 1
 EARLY_DEFENSE_RANGER_TARGET = 1
 DEFENSE_VANGUARD_TARGET = 3
 DEFENSE_RANGER_TARGET = 4
-MAX_WORKER_TARGET = 19 - DEFENSE_VANGUARD_TARGET - DEFENSE_RANGER_TARGET
+MATURE_DEFENSE_WORKER_GOAL = 12
+TARGET_POPULATION = 30
+GROWTH_POPULATION_MILESTONES = (20, 24, 29, TARGET_POPULATION)
+MAX_WORKER_TARGET = TARGET_POPULATION - DEFENSE_VANGUARD_TARGET - DEFENSE_RANGER_TARGET
 VANGUARD_GUARD_RADIUS = 3
 RANGER_GUARD_RADIUS = 2
 VANGUARD_CORE_GUARDS = 1
@@ -96,7 +97,7 @@ RECOVERY_TICKS = 160
 RECOVERY_MIN_WORKERS = 6
 RECOVERY_MIN_RESOURCES = 20
 RECOVERY_THREAT_DISTANCE = 12
-RECOVERY_INFERENCE_RESOURCE_LIMIT = CORE_RESOURCE_RESERVE + WORKER_EXPANSION_COST
+RECOVERY_INFERENCE_RESOURCE_LIMIT = CORE_RESOURCE_RESERVE + unit_cost(UnitType.WORKER, 0)
 LOG_SNAPSHOT_INTERVAL = 20
 PATH_COST_MAX_EXPANSIONS = 512
 PATH_COST_UNREACHABLE = 1_000_000
@@ -1002,18 +1003,19 @@ def _queue_core_delivery_handoff(
     core = turn.core
     if core is None or context.core_position is None:
         return set()
-    empty_workers = sorted(
+    departing_workers = sorted(
         (
             worker
             for worker in turn.workers
-            if worker.cargo == 0 and worker.position == core.position
+            if worker.position == core.position
+            and (worker.cargo == 0 or turn.resource_space == 0)
         ),
         key=_uuid_sort_key,
     )
-    if not empty_workers:
+    if not departing_workers:
         return set()
 
-    empty_worker = empty_workers[0]
+    departing_worker = departing_workers[0]
     passable_neighbors = []
     for direction in CARDINAL_DIRECTIONS:
         destination = _destination(core.position, direction)
@@ -1032,16 +1034,21 @@ def _queue_core_delivery_handoff(
         # useful work. Coordination is needed only when all exits are occupied.
         return set()
 
-    units_by_position = {
-        unit.position: unit
-        for unit in turn.units
-        if context.friendly_counts[unit.position] == 1
-    }
+    units_by_position: dict[Position, list[object]] = {}
+    for unit in turn.units:
+        units_by_position.setdefault(unit.position, []).append(unit)
+    for units in units_by_position.values():
+        units.sort(
+            key=lambda unit: (
+                int(getattr(unit, "cargo", 0) > 0),
+                _uuid_sort_key(unit),
+            )
+        )
     starts = sorted(
         (
-            (position, units_by_position.get(position), index)
+            (position, units_by_position[position][0], index)
             for index, (_, position) in enumerate(passable_neighbors)
-            if context.friendly_counts[position] == 1
+            if 0 < context.friendly_counts[position] <= 2
             and position in units_by_position
         ),
         key=lambda item: (
@@ -1087,7 +1094,7 @@ def _queue_core_delivery_handoff(
 
     handoff: set[UUID] = set()
     for source, destination in reversed(tuple(zip(chain[:-1], chain[1:]))):
-        unit = units_by_position[source]
+        unit = units_by_position[source][0]
         direction = _direction_to_adjacent(source, destination)
         if direction is None or not _queue_move(unit, (direction,), context):
             return handoff
@@ -1096,18 +1103,20 @@ def _queue_core_delivery_handoff(
     first_position = chain[0]
     first_direction = _direction_to_adjacent(core.position, first_position)
     if first_direction is None or not _queue_move(
-        empty_worker,
+        departing_worker,
         (first_direction,),
         context,
+        allow_single_friendly_transit=True,
     ):
         return handoff
-    handoff.add(empty_worker.id)
+    handoff.add(departing_worker.id)
 
     for worker in sorted(
         (
             worker
             for worker in turn.workers
-            if worker.cargo > 0
+            if turn.resource_space > 0
+            and worker.cargo > 0
             and worker.id not in handoff
             and _distance(worker.position, core.position) == 1
         ),
@@ -1404,20 +1413,44 @@ def _worker_expansion_threshold(
     worker_count: int,
     worker_target: int,
     resource_capacity: int,
+    population: int,
 ) -> int:
     if worker_count < BASE_WORKER_TARGET:
         return min(
-            CORE_RESOURCE_RESERVE + WORKER_EXPANSION_COST,
+            CORE_RESOURCE_RESERVE + unit_cost(UnitType.WORKER, population),
             resource_capacity,
         )
 
-    completed_late_stages = (worker_count - BASE_WORKER_TARGET) // 2
-    stage_target = min(
-        worker_target,
-        BASE_WORKER_TARGET + 2 * (completed_late_stages + 1),
+    if worker_count < MATURE_DEFENSE_WORKER_GOAL:
+        completed_late_stages = (worker_count - BASE_WORKER_TARGET) // 2
+        stage_target = min(
+            worker_target,
+            BASE_WORKER_TARGET + 2 * (completed_late_stages + 1),
+        )
+        remaining_units = max(1, stage_target - worker_count)
+        return LATE_EXPANSION_RESERVE + sum(
+            unit_cost(UnitType.WORKER, population + offset)
+            for offset in range(remaining_units)
+        )
+
+    target_population = min(
+        TARGET_POPULATION,
+        worker_target + DEFENSE_VANGUARD_TARGET + DEFENSE_RANGER_TARGET,
     )
-    remaining_stage_workers = max(1, stage_target - worker_count)
-    return LATE_EXPANSION_RESERVE + WORKER_EXPANSION_COST * remaining_stage_workers
+    next_milestone = next(
+        (
+            milestone
+            for milestone in GROWTH_POPULATION_MILESTONES
+            if population < milestone
+        ),
+        target_population,
+    )
+    stage_target = min(target_population, next_milestone)
+    remaining_units = max(1, stage_target - population)
+    return LATE_EXPANSION_RESERVE + sum(
+        unit_cost(UnitType.WORKER, population + offset)
+        for offset in range(remaining_units)
+    )
 
 
 def _uuid_sort_key(obj: object) -> bytes:
@@ -3198,8 +3231,8 @@ class CoreFarmer:
                 worker,
                 core.position,
                 context,
-                allow_core_entry=True,
-                allow_single_friendly_transit=True,
+                allow_core_entry=turn.resource_space > 0,
+                allow_single_friendly_transit=turn.resource_space > 0,
             )
             if not moved:
                 worker.wait()
@@ -4059,7 +4092,7 @@ class CoreFarmer:
             not self.compatibility_hold
             and
             context.friendly_counts[core.position] < 2
-            and len(turn.units) < 19
+            and len(turn.units) < TARGET_POPULATION
         )
         nearest_threat = min(
             (
@@ -4133,7 +4166,7 @@ class CoreFarmer:
                 nearest_threat is not None
                 and nearest_threat <= 3
                 and len(turn.vanguards) < DEFENSE_VANGUARD_TARGET
-                and turn.resources >= VANGUARD_COST
+                and turn.resources >= unit_cost(UnitType.VANGUARD, len(turn.units))
             ):
                 core.spawn(UnitType.VANGUARD)
                 return
@@ -4142,7 +4175,7 @@ class CoreFarmer:
                 and nearest_threat <= 6
                 and len(turn.workers) >= 4
                 and len(turn.rangers) < DEFENSE_RANGER_TARGET
-                and turn.resources >= RANGER_COST
+                and turn.resources >= unit_cost(UnitType.RANGER, len(turn.units))
             ):
                 core.spawn(UnitType.RANGER)
                 return
@@ -4164,7 +4197,8 @@ class CoreFarmer:
                 early_defense_is_safe
                 and len(turn.vanguards) < EARLY_DEFENSE_VANGUARD_TARGET
                 and turn.resources
-                >= EARLY_DEFENSE_RESERVE + VANGUARD_COST
+                >= EARLY_DEFENSE_RESERVE
+                + unit_cost(UnitType.VANGUARD, len(turn.units))
             ):
                 core.spawn(UnitType.VANGUARD)
                 return
@@ -4172,7 +4206,8 @@ class CoreFarmer:
                 early_defense_is_safe
                 and len(turn.vanguards) >= EARLY_DEFENSE_VANGUARD_TARGET
                 and len(turn.rangers) < EARLY_DEFENSE_RANGER_TARGET
-                and turn.resources >= EARLY_DEFENSE_RESERVE + RANGER_COST
+                and turn.resources >= EARLY_DEFENSE_RESERVE
+                + unit_cost(UnitType.RANGER, len(turn.units))
             ):
                 core.spawn(UnitType.RANGER)
                 return
@@ -4182,18 +4217,32 @@ class CoreFarmer:
                 and len(turn.workers)
                 < min(RECOVERY_MIN_WORKERS, self.worker_target)
             ):
-                expansion_threshold = WORKER_EXPANSION_COST
+                expansion_threshold = unit_cost(UnitType.WORKER, len(turn.units))
             else:
                 expansion_threshold = _worker_expansion_threshold(
                     len(turn.workers),
                     self.worker_target,
                     turn.resource_capacity,
+                    len(turn.units),
                 )
             economic_expansion_is_safe = (
                 nearest_threat is None or nearest_threat > 6
             )
+            mature_worker_goal = min(
+                MATURE_DEFENSE_WORKER_GOAL,
+                self.worker_target,
+            )
+            full_defense_ready = (
+                len(turn.workers) >= mature_worker_goal
+                and len(turn.vanguards) >= DEFENSE_VANGUARD_TARGET
+                and len(turn.rangers) >= DEFENSE_RANGER_TARGET
+            )
             if (
                 len(turn.workers) < self.worker_target
+                and (
+                    len(turn.workers) < mature_worker_goal
+                    or full_defense_ready
+                )
                 and turn.resources >= expansion_threshold
                 and economic_expansion_is_safe
             ):
@@ -4201,12 +4250,15 @@ class CoreFarmer:
                 return
 
             mature_for_defense = (
-                len(turn.workers) >= self.worker_target
+                len(turn.workers) >= mature_worker_goal
                 and nearest_threat is None
                 and turn.resources >= LONG_TERM_DEFENSE_RESERVE
             )
             if mature_for_defense and len(turn.vanguards) < DEFENSE_VANGUARD_TARGET:
-                if turn.resources >= LONG_TERM_DEFENSE_RESERVE + VANGUARD_COST:
+                if turn.resources >= LONG_TERM_DEFENSE_RESERVE + unit_cost(
+                    UnitType.VANGUARD,
+                    len(turn.units),
+                ):
                     core.spawn(UnitType.VANGUARD)
                     return
             if (
@@ -4214,7 +4266,10 @@ class CoreFarmer:
                 and len(turn.vanguards) >= DEFENSE_VANGUARD_TARGET
                 and len(turn.rangers) < DEFENSE_RANGER_TARGET
             ):
-                if turn.resources >= LONG_TERM_DEFENSE_RESERVE + RANGER_COST:
+                if turn.resources >= LONG_TERM_DEFENSE_RESERVE + unit_cost(
+                    UnitType.RANGER,
+                    len(turn.units),
+                ):
                     core.spawn(UnitType.RANGER)
                     return
 
@@ -4606,7 +4661,12 @@ def _notify_systemd(*lines: str) -> bool:
     return True
 
 
-def _systemd_status(turn: Turn, tactic: CoreFarmer, accepted_tick: int) -> str:
+def _systemd_status(
+    turn: Turn,
+    tactic: CoreFarmer,
+    accepted_tick: int,
+    decision_ms: float,
+) -> str:
     core = turn.core
     if core is None:
         core_status = "core respawning"
@@ -4623,6 +4683,7 @@ def _systemd_status(turn: Turn, tactic: CoreFarmer, accepted_tick: int) -> str:
         f"STATUS=tick {accepted_tick}; resources {turn.resources}/"
         f"{turn.resource_capacity}; workers {len(turn.workers)}; "
         f"fleet {len(turn.vanguards)}v/{len(turn.rangers)}r; "
+        f"decision_ms {decision_ms:.1f}; "
         f"phase {tactic.strategy_phase(turn)}; {core_status}; "
         f"posture {tactic.threat_assessment.global_posture.value}; "
         f"threat {tactic.threat_assessment.level.value}; "
@@ -4746,13 +4807,16 @@ def play(
                     _emit_resource_ledger(
                         _reconcile_resource_turn(resource_ledger_snapshot, turn)
                     )
+                decision_started = time.perf_counter()
                 tactic.choose_actions(turn)
+                decision_ms = (time.perf_counter() - decision_started) * 1000
                 try:
                     accepted = turn.submit()
                 except APIError as exc:
                     if _is_turn_scoped_api_error(exc.error):
                         print(
-                            f"WARNING tick={turn.tick} plan_skipped error={exc.error}",
+                            f"WARNING tick={turn.tick} plan_skipped error={exc.error} "
+                            f"decision_ms={decision_ms:.1f}",
                             file=sys.stderr,
                             flush=True,
                         )
@@ -4763,7 +4827,7 @@ def play(
                 resource_ledger_snapshot = _resource_ledger_snapshot(turn)
                 _notify_systemd(
                     "WATCHDOG=1",
-                    _systemd_status(turn, tactic, accepted.tick),
+                    _systemd_status(turn, tactic, accepted.tick, decision_ms),
                 )
                 if heartbeat_file is not None:
                     write_heartbeat(
@@ -4777,6 +4841,7 @@ def play(
                     actions, events = _turn_diagnostics(turn)
                     print(
                         f"tick={accepted.tick} accepted={accepted.accepted} "
+                        f"decision_ms={decision_ms:.1f} "
                         f"resources={turn.resources}/{turn.resource_capacity} "
                         f"workers={len(turn.workers)} vanguards={len(turn.vanguards)} "
                         f"rangers={len(turn.rangers)} cargo={sum(worker.cargo for worker in turn.workers)} "

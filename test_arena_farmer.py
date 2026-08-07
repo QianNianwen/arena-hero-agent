@@ -6,7 +6,7 @@ import tempfile
 import threading
 import unittest
 from collections import deque
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 from uuid import UUID
@@ -160,8 +160,6 @@ def make_turn(
             "respawn_at_tick": None if core else tick + 10,
             "resources": resources,
             "population": len(units or []),
-            "population_tier": 0,
-            "upkeep_next_tick": 0,
             "champion_beacon": beacon,
             "objects": objects,
             "events": events or [],
@@ -266,6 +264,9 @@ class CoreFarmerTests(unittest.TestCase):
             WORKER_10,
             WORKER_11,
             WORKER_12,
+        ] + [
+            f"20000000-0000-4000-8000-{index:012x}"
+            for index in range(16, 26)
         ]
         positions = [
             (1, 0),
@@ -281,6 +282,7 @@ class CoreFarmerTests(unittest.TestCase):
             (-2, -1),
             (-1, -2),
         ]
+        positions.extend((index, 3) for index in range(7, 17))
         return [
             unit(identifier, "WORKER", position, cargo=cargo)
             for identifier, position in zip(
@@ -2060,6 +2062,26 @@ class CoreFarmerTests(unittest.TestCase):
         second_plan = depositing.plan.model_dump(mode="json", exclude_none=True)
         self.assertEqual(second_plan["unit_actions"][WORKER_2]["type"], "DEPOSIT")
 
+    def test_full_core_cargo_handoff_clears_spawn_lane(self) -> None:
+        queued = plan(
+            make_turn(
+                resources=25,
+                units=[
+                    unit(WORKER_1, "WORKER", (0, 0), cargo=1),
+                    unit(WORKER_2, "WORKER", (1, 0), cargo=1),
+                    unit(WORKER_3, "WORKER", (1, 0), cargo=1),
+                    unit(WORKER_4, "WORKER", (-1, 0), cargo=1),
+                    unit(WORKER_5, "WORKER", (-1, 0), cargo=1),
+                ],
+                obstacles=[(0, -1), (0, 1)],
+            ),
+            beacon_policy="hold",
+        )
+
+        self.assertEqual(queued["unit_actions"][WORKER_1]["type"], "MOVE")
+        self.assertEqual(queued["core_action"]["type"], "SPAWN")
+        self.assertEqual(queued["core_action"]["unit_type"], "WORKER")
+
     def test_visible_enemy_worker_does_not_disable_safe_delivery_handoff(self) -> None:
         queued = plan(
             make_turn(
@@ -3021,28 +3043,28 @@ class CoreFarmerTests(unittest.TestCase):
         self.assertEqual(tactic.isolated_core_target_id, UUID(ENEMY_1))
 
     def test_worker_limit_reserves_seven_defense_slots(self) -> None:
-        CoreFarmer(worker_target=12)
-        with self.assertRaisesRegex(ValueError, "between 1 and 12"):
-            CoreFarmer(worker_target=13)
+        CoreFarmer(worker_target=23)
+        with self.assertRaisesRegex(ValueError, "between 1 and 23"):
+            CoreFarmer(worker_target=24)
 
-    def test_population_hard_stops_at_19_without_self_destruct(self) -> None:
+    def test_population_hard_stops_at_30_without_self_destruct(self) -> None:
         units = [
             unit(
                 f"20000000-0000-4000-8000-{index:012x}",
                 (
                     "WORKER"
-                    if index < 12
+                    if index < 23
                     else "VANGUARD"
-                    if index < 15
+                    if index < 26
                     else "RANGER"
                 ),
                 (20 + index, 20),
-                cargo=0 if index < 12 else None,
+                cargo=0 if index < 23 else None,
             )
-            for index in range(19)
+            for index in range(30)
         ]
-        turn = make_turn(resources=95, units=units)
-        tactic = CoreFarmer(worker_target=12, beacon_policy="hold")
+        turn = make_turn(resources=200, units=units)
+        tactic = CoreFarmer(worker_target=23, beacon_policy="hold")
         tactic.choose_actions(turn)
         queued = turn.plan.model_dump(mode="json", exclude_none=True)
 
@@ -3056,6 +3078,40 @@ class CoreFarmerTests(unittest.TestCase):
                 for action in queued.get("unit_actions", {}).values()
             )
         )
+
+    def test_dynamic_worker_price_stages(self) -> None:
+        fleet = [
+            unit(VANGUARD_1, "VANGUARD", (3, 0)),
+            unit(VANGUARD_2, "VANGUARD", (4, 0)),
+            unit(VANGUARD_3, "VANGUARD", (4, 1)),
+            unit(RANGER_1, "RANGER", (5, 0)),
+            unit(RANGER_2, "RANGER", (5, 1)),
+            unit(RANGER_3, "RANGER", (5, 2)),
+            unit(RANGER_4, "RANGER", (5, 3)),
+        ]
+        cases = ((12, 19, 19, 20), (13, 20, 42, 43), (17, 24, 53, 54), (22, 29, 22, 23))
+        for workers_count, population, blocked, expanding in cases:
+            with self.subTest(population=population):
+                blocked_turn = make_turn(
+                    resources=blocked,
+                    units=self._workers(workers_count) + fleet,
+                )
+                self.assertNotEqual(
+                    plan(blocked_turn, beacon_policy="hold")
+                    .get("core_action", {})
+                    .get("unit_type"),
+                    "WORKER",
+                )
+                expanding_turn = make_turn(
+                    resources=expanding,
+                    units=self._workers(workers_count) + fleet,
+                )
+                self.assertEqual(
+                    plan(expanding_turn, beacon_policy="hold")["core_action"][
+                        "unit_type"
+                    ],
+                    "WORKER",
+                )
 
     def test_four_workers_accumulate_before_expanding_to_six(self) -> None:
         workers = [
@@ -4062,9 +4118,10 @@ class EventLoopTests(unittest.TestCase):
         turn = make_turn(core=False)
         tactic = CoreFarmer()
         tactic.choose_actions(turn)
-        status = _systemd_status(turn, tactic, turn.tick)
+        status = _systemd_status(turn, tactic, turn.tick, 12.5)
         self.assertIn("core respawning", status)
         self.assertIn("core_hp none", status)
+        self.assertIn("decision_ms 12.5", status)
         self.assertIn("posture RESPAWNING", status)
         self.assertIn("threat NORMAL", status)
 
@@ -4080,15 +4137,18 @@ class EventLoopTests(unittest.TestCase):
                 return None
 
             def events(self):
-                yield make_turn(core=False)
+                yield make_turn(tick=20, core=False)
 
         notifications: list[tuple[str, ...]] = []
+        output = io.StringIO()
         with (
             patch("arena_farmer.ArenaHeroClient", FakeGame),
             patch(
                 "arena_farmer._notify_systemd",
                 side_effect=lambda *lines: notifications.append(lines) or True,
             ),
+            patch("arena_farmer.time.perf_counter", side_effect=(10.0, 10.0125)),
+            redirect_stdout(output),
             self.assertRaisesRegex(OSError, "event stream ended unexpectedly"),
         ):
             play(
@@ -4098,6 +4158,8 @@ class EventLoopTests(unittest.TestCase):
                 beacon_policy="retreat",
             )
         self.assertIn("core respawning", notifications[0][1])
+        self.assertIn("decision_ms 12.5", notifications[0][1])
+        self.assertIn("decision_ms=12.5", output.getvalue())
 
     def test_periodic_and_significant_turns_are_logged(self) -> None:
         self.assertTrue(_should_log_turn(make_turn(tick=20)))

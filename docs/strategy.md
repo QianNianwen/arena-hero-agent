@@ -8,18 +8,16 @@ The mature target is:
 
 | Unit | Target | Role |
 | --- | ---: | --- |
-| Worker | 12 | Harvest, deposit, scout, observe, and recover dropped cargo. |
+| Worker | 23 | Harvest, deposit, scout, observe, and recover dropped cargo. |
 | Vanguard | 3 | Outer screen, route screening, and bounded assault reinforcement. |
 | Ranger | 4 | Inner Core defense and ranged stationary-target clearing. |
-| Total | 19 | Remains below the 20-population resource penalty. |
+| Total | 30 | Uses the v0.14 capacity formula for a 150-resource Core. |
 
-Production reserves resources between stages and does not build beyond the configured Worker target and defense targets.
+Production first reaches 12 Workers, then completes 3 Vanguards and 4 Rangers before expanding Workers in the 19->20, 20->24, 24->29, and 29->30 price bands. It does not build beyond the configured Worker target and defense targets.
 
-The proposed `15 Worker + 2 Vanguard + 2 Ranger` profile also stays at 19, but
-it removes one Vanguard and two Rangers from the current survival envelope. It
-remains an A/B-test candidate rather than the default until collection
-throughput, unit loss, Core damage, healing cost, and unattended survival can be
-compared over equivalent windows.
+The 30-population profile is the default accumulation envelope. A smaller
+Worker target remains supported for recovery or controlled experiments, but it
+does not change the full-defense ordering when the target reaches 12 Workers.
 
 ## Core Safety
 
@@ -61,7 +59,7 @@ compared over equivalent windows.
   or imminent cargo delivery pauses the return.
 - Confirmed stationary units can be cleared by a small bounded strike group while guards remain with the Core, but only outside combat pressure.
 - A stationary Core is considered for a raid only after repeated observations and isolation checks. The Worker that exposed it may remain as the designated observer. The default strike group can engage from at most 48 path-independent Manhattan cells and releases a target if pulled beyond 56, while one Vanguard and one Ranger remain as Core guards.
-- Under gameplay v0.13, Rangers use target-free cell fire for legal defensive shots so another hostile remaining in the submitted cell can still be hit. A strike Ranger may also fire at the remembered cell of a confirmed stationary Core during a short visibility gap.
+- Under gameplay v0.14, Rangers use target-free cell fire for legal defensive shots so another hostile remaining in the submitted cell can still be hit. A strike Ranger may also fire at the remembered cell of a confirmed stationary Core during a short visibility gap.
 - Loss of visibility does not immediately invalidate stationary-target memory, but moving escorts, contradictory observations, age, and risk reduce confidence.
 - Loot events, storage capacity, same-Tick Core survival, and return-path cost determine whether a kill was economically useful.
 

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path
 
 import httpx
@@ -59,6 +60,9 @@ class FakeClient:
 
 
 class VersionMonitorTests(unittest.TestCase):
+    def test_reviewed_sdk_matches_installed_dependency(self) -> None:
+        self.assertEqual(version("arena-hero"), REVIEWED_SDK_VERSION)
+
     def test_matching_versions_remove_old_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

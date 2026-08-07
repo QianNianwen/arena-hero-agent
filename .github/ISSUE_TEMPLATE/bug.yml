@@ -36,7 +36,7 @@ body:
     id: contract_version
     attributes:
       label: Arena Hero API and gameplay contract
-      description: For example, API v0.1 / gameplay v0.13, or unknown.
+      description: For example, API v0.1 / gameplay v0.14, or unknown.
     validations:
       required: true
   - type: input
