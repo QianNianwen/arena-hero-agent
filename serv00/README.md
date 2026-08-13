@@ -7,7 +7,8 @@
 | Windows | serv00 |
 | --- | --- |
 | `scripts/bootstrap.ps1` | `serv00/bootstrap.sh` |
-| `start_agent.ps1` / `start_agent.cmd` | `serv00/start_agent.sh` |
+| `start_agent.ps1` / `start_agent.cmd` | `serv00/start_agent.sh`（前台） |
+| （无） | `serv00/start.sh`（FreeBSD `daemon` 后台启停） |
 
 ## 前置条件
 
@@ -15,6 +16,7 @@
 - 已在面板开启 **Binexec**（安装自定义软件/虚拟环境前必须）
 - Python 3.11+（`python3.11` / `python3.12`）
 - 系统提供 `virtualenv`（脚本优先使用；缺失时回退 `python -m venv`）
+- 后台运行需要 FreeBSD `daemon` 命令
 - Arena Hero API Key
 
 ## 快速开始
@@ -23,16 +25,50 @@
 git clone https://github.com/WuDiWangWaSai/arena-hero-agent.git
 cd arena-hero-agent
 sh serv00/bootstrap.sh
+sh serv00/start.sh start
+```
+
+前台运行（对齐 Windows，可交互录入 API Key）：
+
+```sh
 sh serv00/start_agent.sh
 ```
 
 仅运行 Agent：
 
 ```sh
+sh serv00/start.sh start --no-dashboard
+# 或前台：
 sh serv00/start_agent.sh --no-dashboard
 ```
 
-可选参数（与 Windows 语义对齐）：
+## 后台启停（推荐）
+
+使用 FreeBSD `daemon` 写入 `bot.pid` / `bot.log`：
+
+```sh
+sh serv00/start.sh start
+sh serv00/start.sh status
+sh serv00/start.sh restart
+sh serv00/start.sh stop
+```
+
+默认同时后台启动战术展示页（`dashboard.pid` / `dashboard.log`）。无参数时默认 `start`。
+
+后台启动**不会**交互询问 API Key。请先准备 `.env` 或环境变量 `ARENA_HERO_API_KEY`。若还没有密钥，可先跑一次前台脚本录入：
+
+```sh
+sh serv00/start_agent.sh --no-dashboard
+```
+
+虚拟环境解析顺序：
+
+1. `ARENA_PYTHON`
+2. 项目内 `.venv/bin/python`（`bootstrap.sh` 产物）
+3. `ARENA_VENV_ACTIVATE`
+4. `~/.virtualenvs/arena-hero/bin/activate`
+
+## 前台可选参数
 
 ```sh
 sh serv00/start_agent.sh \
@@ -65,7 +101,7 @@ sh serv00/start_agent.sh \
 cpuset -l 0 .venv/bin/python -m pip install --require-hashes -r requirements.lock
 ```
 
-## start_agent 行为
+## start_agent 行为（前台）
 
 - 缺失 API Key 时交互写入项目根目录 `.env`（权限尽量设为 `600`）
 - 单实例锁：`state/serv00-agent.lock`
@@ -81,7 +117,7 @@ cpuset -l 0 .venv/bin/python -m pip install --require-hashes -r requirements.loc
 若需要从外网访问，请先在 serv00 预留端口，再显式指定：
 
 ```sh
-sh serv00/start_agent.sh --dashboard-host 0.0.0.0 --dashboard-port <预留端口>
+sh serv00/start.sh start --dashboard-host 0.0.0.0 --dashboard-port <预留端口>
 ```
 
 本方案**不**使用 Phusion Passenger / WSGI，保持与 Windows 相同的 `arena_dashboard` HTTP 服务启动方式。
@@ -92,11 +128,13 @@ sh serv00/start_agent.sh --dashboard-host 0.0.0.0 --dashboard-port <预留端口
 | --- | --- |
 | `.venv/` | virtualenv 环境 |
 | `.env` | API Key（勿提交 Git） |
-| `arena_farmer.log` | Agent 日志 |
+| `bot.pid` / `bot.log` | 后台 Agent 的 pid 与日志 |
+| `dashboard.pid` / `dashboard.log` | 后台展示页的 pid 与日志 |
+| `arena_farmer.log` | 前台 Agent 日志 |
 | `arena_history.sqlite3` | 战术历史库 |
-| `arena_dashboard.log` | 展示页标准输出 |
-| `arena_dashboard.error.log` | 展示页错误输出 |
-| `state/serv00-agent.lock` | 单实例锁 |
+| `arena_dashboard.log` | 前台展示页标准输出 |
+| `arena_dashboard.error.log` | 前台展示页错误输出 |
+| `state/serv00-agent.lock` | 前台单实例锁 |
 
 ## 与生产 systemd 的关系
 
