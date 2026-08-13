@@ -32,6 +32,8 @@ const ui = {
   cursorPosition: document.querySelector("#cursor-position"),
   productionForm: document.querySelector("#production-form"),
   productionStatus: document.querySelector("#production-status"),
+  allianceForm: document.querySelector("#alliance-form"),
+  allianceStatus: document.querySelector("#alliance-status"),
   expeditionForm: document.querySelector("#expedition-form"),
   expeditionStatus: document.querySelector("#expedition-status"),
   expeditionList: document.querySelector("#expedition-list"),
@@ -46,6 +48,7 @@ const colors = {
   resource: "#40cc87",
   resourceHistory: "#b88f24",
   friendly: "#3db8e3",
+  ally: "#ffb7c5",
   enemy: "#ee6268",
   oldCore: "#873f44",
   beacon: "#f0c84c",
@@ -71,7 +74,7 @@ const state = {
   pointerStart: null,
   pickingTarget: false,
   orderTarget: null,
-  controlConfig: { production: null, expeditions: [] },
+  controlConfig: { production: null, alliance: { rally_radius: 12 }, expeditions: [] },
   layers: { explored: true, obstacles: true, resources: true, history: true, routes: false },
   pickMode: null,
   viewport: { width: 1, height: 1 },
@@ -189,32 +192,36 @@ function drawTrail(points) {
   context.stroke();
 }
 
-function drawCore(item, friendly, historical = false) {
+function drawCore(item, relation, historical = false) {
   const [x, y] = screenPosition(item.position || [item.x, item.y]);
   const size = Math.max(7, state.view.scale * 0.82);
   context.save();
   context.globalAlpha = historical ? 0.52 : 1;
   context.setLineDash(historical ? [4, 3] : []);
-  context.fillStyle = historical ? colors.oldCore : friendly ? colors.friendly : colors.enemy;
+  const friendly = relation === "friendly";
+  const allied = relation === "ally";
+  context.fillStyle = historical ? colors.oldCore : allied ? colors.ally : friendly ? colors.friendly : colors.enemy;
   context.fillRect(x - size / 2, y - size / 2, size, size);
   context.strokeStyle = historical ? "#cb7178" : colors.label;
   context.lineWidth = historical ? 1 : 1.5;
   context.strokeRect(x - size / 2, y - size / 2, size, size);
-  if (!friendly && state.view.scale >= 5) {
-    const name = item.owner_username ? `@${item.owner_username}` : "敌方 Core";
+  if ((!friendly || allied) && state.view.scale >= 5) {
+    const name = item.owner_username ? `@${item.owner_username}` : allied ? "盟友 Core" : "敌方 Core";
     const age = historical ? ` · 最后发现 ${item.age_ticks}T 前` : "";
-    context.fillStyle = historical ? "#c78388" : "#ff9b9f";
+    context.fillStyle = historical ? "#c78388" : allied ? "#ffd7df" : "#ff9b9f";
     context.font = "11px Segoe UI, Microsoft YaHei, sans-serif";
     context.fillText(`${name}${age}`, x + size / 2 + 5, y + 4);
   }
   context.restore();
 }
 
-function drawUnit(item, friendly) {
+function drawUnit(item, relation) {
   const [x, y] = screenPosition(item.position);
   const radius = Math.max(2.5, state.view.scale * 0.28);
-  context.fillStyle = friendly ? colors.friendly : colors.enemy;
-  context.strokeStyle = friendly ? "#a8e8ff" : "#ffb0b3";
+  const friendly = relation === "friendly";
+  const allied = relation === "ally";
+  context.fillStyle = allied ? colors.ally : friendly ? colors.friendly : colors.enemy;
+  context.strokeStyle = allied ? "#ffe0e7" : friendly ? "#a8e8ff" : "#ffb0b3";
   context.lineWidth = 1;
   context.beginPath();
   if (item.unit_type === "VANGUARD") {
@@ -321,9 +328,11 @@ function draw() {
   if (state.layers.routes) Object.values(overview.trails || {}).forEach(drawTrail);
 
   const objects = overview.state.objects || [];
+  const allianceObjects = overview.alliance_objects || [];
+  const allianceIds = new Set(allianceObjects.map((item) => item.id));
   (state.layers.history ? overview.enemy_core_history : [])
-    .filter((item) => !item.currently_visible)
-    .forEach((item) => drawCore(item, false, true));
+    .filter((item) => !item.currently_visible && !allianceIds.has(item.core_id))
+    .forEach((item) => drawCore(item, "enemy", true));
 
   const objectById = new Map();
   for (const item of objects) {
@@ -331,8 +340,13 @@ function draw() {
     if (item.id) objectById.set(item.id, item);
   }
   for (const item of objects) {
-    if (item.kind === "CORE") drawCore(item, item.controlled);
-    if (item.kind === "UNIT") drawUnit(item, item.controlled);
+    if (allianceIds.has(item.id) || item.relation === "ALLY") continue;
+    if (item.kind === "CORE") drawCore(item, item.controlled ? "friendly" : "enemy");
+    if (item.kind === "UNIT") drawUnit(item, item.controlled ? "friendly" : "enemy");
+  }
+  for (const item of allianceObjects) {
+    if (item.kind === "CORE") drawCore(item, "ally");
+    if (item.kind === "UNIT") drawUnit(item, "ally");
   }
   drawPlan(overview, objectById);
   drawRoutes(overview);
@@ -399,7 +413,9 @@ function updateMetrics() {
   const workers = units.filter((item) => item.unit_type === "WORKER").length;
   const vanguards = units.filter((item) => item.unit_type === "VANGUARD").length;
   const rangers = units.filter((item) => item.unit_type === "RANGER").length;
-  const enemies = game.objects.filter((item) => item.controlled === false).length;
+  const enemies = Number.isInteger(overview.enemy_count)
+    ? overview.enemy_count
+    : game.objects.filter((item) => item.controlled === false && item.relation !== "ALLY").length;
   ui.tick.textContent = overview.tick;
   ui.resources.textContent = `${game.resources}/${Math.max(10, game.population * 5)}`;
   ui.population.textContent = game.population;
@@ -599,13 +615,17 @@ function renderUnitPicker() {
     [...ui.unitList.querySelectorAll("input:checked")].map((input) => input.value),
   );
   const units = state.controlUnits
-    .filter((unit) => unit.unit_type === selectedType)
+    .filter((unit) => (
+      selectedType === "CORE"
+        ? unit.kind === "CORE"
+        : unit.kind === "UNIT" && unit.unit_type === selectedType
+    ))
     .sort((left, right) => left.id.localeCompare(right.id));
   ui.unitList.replaceChildren();
   if (!units.length) {
     const empty = document.createElement("span");
     empty.className = "empty-state";
-    empty.textContent = `当前没有 ${selectedType}`;
+    empty.textContent = `当前没有可派遣的 ${selectedType}`;
     ui.unitList.append(empty);
   } else {
     units.forEach((unit) => {
@@ -694,7 +714,7 @@ async function refreshControl() {
     state.orders = orders || [];
     state.controlConfig = controlConfig;
     state.controlUnits = (overview.state?.objects || []).filter(
-      (item) => item.kind === "UNIT" && item.controlled === true,
+      (item) => ["CORE", "UNIT"].includes(item.kind) && item.controlled === true,
     );
     renderControl();
     const production = controlConfig.production;
@@ -702,6 +722,10 @@ async function refreshControl() {
       document.querySelector("#production-worker").value = production.worker_weight;
       document.querySelector("#production-vanguard").value = production.vanguard_weight;
       document.querySelector("#production-ranger").value = production.ranger_weight;
+    }
+    const alliance = controlConfig.alliance;
+    if (alliance && document.activeElement?.form !== ui.allianceForm) {
+      document.querySelector("#alliance-rally-radius").value = alliance.rally_radius;
     }
   } catch (error) {
     ui.orderStatus.textContent = `调兵接口错误 · ${error.message}`;
@@ -823,7 +847,7 @@ ui.orderForm.addEventListener("submit", async (event) => {
   ui.orderStatus.textContent = "提交中…";
   const unitIds = [...ui.unitList.querySelectorAll("input:checked")].map((input) => input.value);
   if (!unitIds.length) {
-    ui.orderStatus.textContent = "请先选择至少一个具体单位";
+    ui.orderStatus.textContent = "请先选择具体核心或至少一个具体单位";
     return;
   }
   const payload = {
@@ -893,6 +917,24 @@ ui.productionForm.addEventListener("submit", async (event) => {
     await refreshControl();
   } catch (error) {
     ui.productionStatus.textContent = `保存失败 · ${error.message}`;
+  }
+});
+
+ui.allianceForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = {
+    rally_radius: Number(document.querySelector("#alliance-rally-radius").value),
+  };
+  try {
+    const response = await fetch("/api/alliance-config", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.message || response.statusText);
+    ui.allianceStatus.textContent = `靠拢距离已设为 ${result.rally_radius} 格，将在下个 Tick 生效`;
+    await refreshControl();
+  } catch (error) {
+    ui.allianceStatus.textContent = `保存失败 · ${error.message}`;
   }
 });
 
