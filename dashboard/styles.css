@@ -114,7 +114,62 @@ button:focus-visible, input:focus-visible, canvas:focus-visible { outline: 2px s
 .map-toolbar button { height: 28px; padding: 0 9px; }
 .map-toolbar label { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #aab5bc; }
 .map-toolbar input { accent-color: var(--green); }
-.cursor-position { position: absolute; right: 14px; top: 14px; padding: 5px 7px; color: #aeb9c0; background: rgba(10, 14, 17, 0.88); border: 1px solid var(--border); font-size: 11px; pointer-events: none; }
+.cursor-position { position: absolute; right: 14px; top: 52px; padding: 5px 7px; color: #aeb9c0; background: rgba(10, 14, 17, 0.88); border: 1px solid var(--border); font-size: 11px; pointer-events: none; }
+
+.panel-toggle {
+  position: absolute;
+  z-index: 3;
+  top: 10px;
+  right: 10px;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  font-size: 17px;
+  line-height: 1;
+  color: #dce7ec;
+  background: rgba(10, 14, 17, 0.9);
+}
+
+.map-zoom-controls {
+  position: absolute;
+  z-index: 3;
+  right: 10px;
+  bottom: 52px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.map-zoom-controls .icon-button {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  font-size: 19px;
+  line-height: 1;
+  color: #dce7ec;
+  background: rgba(10, 14, 17, 0.9);
+}
+
+body.panel-hidden .workspace { grid-template-columns: 1fr; }
+body.panel-hidden .intel-panel { display: none; }
+
+.coord-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 4px;
+  margin: -2px 0;
+  font: inherit;
+  font-size: inherit;
+  color: var(--cyan);
+  background: rgba(61, 184, 227, 0.12);
+  border: 1px solid rgba(61, 184, 227, 0.35);
+  border-radius: 3px;
+  cursor: pointer;
+  line-height: inherit;
+}
+.coord-link:hover { background: rgba(61, 184, 227, 0.22); border-color: var(--cyan); }
+.coord-link::before { content: "⌖"; font-size: 10px; margin-right: 2px; }
 .config-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
 .config-form h3, .config-form .wide, .config-form button, .config-form .form-status { grid-column: 1 / -1; }
 .config-form h3 { margin: 0 0 2px; font-size: 12px; }
@@ -319,8 +374,12 @@ button:focus-visible, input:focus-visible, canvas:focus-visible { outline: 2px s
   .controls { grid-column: 2; grid-row: 1; }
   .controls #tick-slider, .controls #previous-tick, .controls #next-tick, .controls #zoom-out, .controls #zoom-in { display: none; }
   .workspace { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) 280px; }
+  body.panel-hidden .workspace { grid-template-rows: 1fr; }
   .intel-panel { border-left: 0; border-top: 1px solid var(--border); }
   .legend { grid-template-columns: repeat(2, auto); left: 8px; bottom: 8px; }
   .map-toolbar label { display: none; }
   .map-status { right: 8px; bottom: 8px; max-width: 48%; }
+  .map-zoom-controls { right: 8px; bottom: 46px; }
+  .panel-toggle { top: 8px; right: 8px; }
+  .cursor-position { top: 48px; right: 8px; }
 }

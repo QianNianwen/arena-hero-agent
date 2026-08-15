@@ -36,6 +36,10 @@ const ui = {
   hoverTooltip: document.querySelector("#hover-tooltip"),
   productionForm: document.querySelector("#production-form"),
   productionStatus: document.querySelector("#production-status"),
+  panelToggle: document.querySelector("#panel-toggle"),
+  mapZoomIn: document.querySelector("#map-zoom-in"),
+  mapZoomOut: document.querySelector("#map-zoom-out"),
+  mapZoomHome: document.querySelector("#map-zoom-home"),
   allianceForm: document.querySelector("#alliance-form"),
   allianceStatus: document.querySelector("#alliance-status"),
   expeditionForm: document.querySelector("#expedition-form"),
@@ -85,6 +89,8 @@ const state = {
   mapIndex: Object.fromEntries(MAP_LAYERS.map((name) => [name, new Map()])),
   unitFilter: "ALL",
   useRelativeCoords: false,
+  panelVisible: true,
+  flashTarget: null,
 };
 // 获取己方 Core 的绝对坐标
 function getCorePosition() {
@@ -120,6 +126,7 @@ function formatCoordDisplay(worldPos) {
 }
 
 let drawFrame = 0;
+let flashFrame = 0;
 //悬停计时相关变量
 let hoverTimer = null;
 let currentHoverCell = null;
@@ -288,7 +295,7 @@ function drawIndexedCells(name, color, size = 1) {
 }
 
 function scheduleDraw() {
-  if (drawFrame) return;
+  if (drawFrame || flashFrame) return;
   drawFrame = requestAnimationFrame(() => {
     drawFrame = 0;
     draw();
@@ -389,6 +396,20 @@ function drawUnit(item, relation) {
   }
   context.fill();
   context.stroke();
+
+  // 携带资源的工兵添加绿色小角标
+  if (item.unit_type === "WORKER" && item.cargo > 0) {
+    const badgeRadius = Math.max(1.8, radius * 0.45);
+    const badgeX = x + radius * 0.7;
+    const badgeY = y - radius * 0.7;
+    context.beginPath();
+    context.arc(badgeX, badgeY, badgeRadius, 0, Math.PI * 2);
+    context.fillStyle = colors.resource;
+    context.fill();
+    context.strokeStyle = colors.background;
+    context.lineWidth = 0.8;
+    context.stroke();
+  }
 }
 
 function drawPlan(overview, objectById) {
@@ -427,6 +448,143 @@ function drawOrderTarget() {
   context.font = "11px Segoe UI, Microsoft YaHei, sans-serif";
   context.fillText(`${state.orderTarget[0]}, ${state.orderTarget[1]}`, x + size + 4, y - 4);
   context.restore();
+}
+
+function drawFlashTarget() {
+  if (!state.flashTarget || state.flashTarget.until < Date.now()) return;
+  const position = state.flashTarget.position;
+  if (!visibleAt(position)) return;
+  const [x, y] = screenPosition(position);
+  const size = Math.max(10, state.view.scale * 0.75);
+  const elapsed = state.flashTarget.until - Date.now();
+  const alpha = Math.min(1, elapsed / 300);
+  context.save();
+  context.strokeStyle = `rgba(240, 200, 76, ${alpha})`;
+  context.lineWidth = 2;
+  context.setLineDash([4, 4]);
+  context.beginPath();
+  context.arc(x, y, size, 0, Math.PI * 2);
+  context.stroke();
+  context.restore();
+}
+
+function coordLink(x, y, label = null) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "coord-link";
+  button.textContent = label || `${x},${y}`;
+  button.dataset.coordX = x;
+  button.dataset.coordY = y;
+  button.title = `定位到 (${x}, ${y})`;
+  return button;
+}
+
+function locatePosition(position, targetScale = null) {
+  state.view.x = position[0];
+  state.view.y = position[1];
+  if (targetScale != null) {
+    state.view.scale = Math.max(1.5, Math.min(32, targetScale));
+  }
+  state.centered = false;
+  state.flashTarget = { position: [...position], until: Date.now() + 1200 };
+  updateMetrics();
+  draw();
+}
+
+function handleCoordClick(event) {
+  const link = event.target.closest(".coord-link");
+  if (!link) return;
+  const x = Number(link.dataset.coordX);
+  const y = Number(link.dataset.coordY);
+  if (Number.isSafeInteger(x) && Number.isSafeInteger(y)) {
+    locatePosition([x, y], Math.max(state.view.scale, 8));
+  }
+}
+
+function hasVisibleEnemies() {
+  const objects = state.overview?.state?.objects || [];
+  const allianceIds = new Set(state.overview?.alliance_objects?.map((item) => item.id) || []);
+  return objects.some((item) =>
+    item.controlled === false &&
+    !allianceIds.has(item.id) &&
+    item.relation !== "ALLY" &&
+    shouldDrawObject(item) &&
+    item.position,
+  );
+}
+
+function drawEnemyFlash() {
+  const objects = state.overview?.state?.objects || [];
+  const allianceIds = new Set(state.overview?.alliance_objects?.map((item) => item.id) || []);
+  const now = Date.now();
+  const pulse = (Math.sin(now / 220) + 1) / 2;
+
+  const enemies = objects.filter((item) =>
+    item.controlled === false &&
+    !allianceIds.has(item.id) &&
+    item.relation !== "ALLY" &&
+    shouldDrawObject(item) &&
+    item.position,
+  );
+  if (!enemies.length) return;
+
+  context.save();
+  for (const item of enemies) {
+    const [x, y] = screenPosition(item.position);
+    const isCore = item.kind === "CORE";
+    const baseSize = isCore
+      ? Math.max(12, state.view.scale * 0.95)
+      : Math.max(8, state.view.scale * 0.42);
+    const radius = baseSize + pulse * (isCore ? 5 : 3);
+    const alpha = 0.25 + pulse * 0.55;
+
+    context.strokeStyle = `rgba(238, 98, 104, ${alpha})`;
+    context.lineWidth = isCore ? 2.5 : 1.5;
+    context.beginPath();
+    if (isCore) {
+      const half = radius;
+      context.rect(x - half, y - half, half * 2, half * 2);
+    } else {
+      context.arc(x, y, radius, 0, Math.PI * 2);
+    }
+    context.stroke();
+  }
+  context.restore();
+}
+
+function startEnemyFlashLoop() {
+  if (flashFrame) return;
+  flashFrame = requestAnimationFrame(function loop() {
+    if (!hasVisibleEnemies()) {
+      flashFrame = 0;
+      return;
+    }
+    draw();
+    flashFrame = requestAnimationFrame(loop);
+  });
+}
+
+function drawStar(cx, cy, spikes, outerRadius, innerRadius) {
+  let rot = Math.PI / 2 * 3;
+  let x = cx;
+  let y = cy;
+  const step = Math.PI / spikes;
+
+  context.beginPath();
+  context.moveTo(cx, cy - outerRadius);
+  for (let i = 0; i < spikes; i++) {
+    x = cx + Math.cos(rot) * outerRadius;
+    y = cy + Math.sin(rot) * outerRadius;
+    context.lineTo(x, y);
+    rot += step;
+
+    x = cx + Math.cos(rot) * innerRadius;
+    y = cy + Math.sin(rot) * innerRadius;
+    context.lineTo(x, y);
+    rot += step;
+  }
+  context.lineTo(cx, cy - outerRadius);
+  context.closePath();
 }
 
 function drawRoutes(overview) {
@@ -504,22 +662,24 @@ function draw() {
   }
   drawPlan(overview, objectById);
   drawRoutes(overview);
+  drawEnemyFlash();
+  startEnemyFlashLoop();
 
   const beacon = overview.state.champion_beacon;
   if (beacon?.position) {
     const [x, y] = screenPosition(beacon.position);
-    const size = Math.max(5, state.view.scale * 0.5);
+    const outer = Math.max(6, state.view.scale * 0.6);
+    const inner = outer * 0.4;
     context.fillStyle = colors.beacon;
-    context.beginPath();
-    context.moveTo(x, y - size);
-    context.lineTo(x + size, y);
-    context.lineTo(x, y + size);
-    context.lineTo(x - size, y);
-    context.closePath();
+    context.strokeStyle = "#8a6d1f";
+    context.lineWidth = 1;
+    drawStar(x, y, 5, outer, inner);
     context.fill();
+    context.stroke();
   }
   drawOrderTarget();
   drawSelectedUnitsHighlight();
+  drawFlashTarget();
 }
 
 function setTargetPicking(active, mode = "order") {
@@ -604,9 +764,17 @@ function renderEvents() {
     tick.textContent = `t${event.tick}`;
     const text = document.createElement("span");
     text.className = eventClass(event.event_type);
-    const position = event.position ? ` @ ${event.position[0]},${event.position[1]}` : "";
-    const reason = event.reason_code ? ` / ${event.reason_code}` : "";
-    text.textContent = `${event.event_type}${reason}${position}`;
+    text.append(event.event_type);
+    if (event.reason_code) {
+      const reason = document.createElement("span");
+      reason.textContent = ` / ${event.reason_code}`;
+      text.append(reason);
+    }
+    if (event.position) {
+      const at = document.createElement("span");
+      at.textContent = " @ ";
+      text.append(at, coordLink(event.position[0], event.position[1]));
+    }
     item.append(tick, text);
     ui.events.append(item);
   });
@@ -675,9 +843,11 @@ function renderControl() {
   } else {
     recentKills.forEach((kill) => {
       const item = document.createElement("li");
-      const position = Array.isArray(kill.position) ? ` @ ${kill.position[0]},${kill.position[1]}` : "";
       const username = kill.username ? ` @${kill.username}` : "";
-      item.textContent = `t${kill.tick} ${kill.kind === "CORE" ? "Core" : "单位"}${username}${position}`;
+      item.append(`t${kill.tick} ${kill.kind === "CORE" ? "Core" : "单位"}${username}`);
+      if (Array.isArray(kill.position)) {
+        item.append(" @ ", coordLink(kill.position[0], kill.position[1]));
+      }
       ui.kills.append(item);
     });
   }
@@ -690,10 +860,12 @@ function renderControl() {
       item.className = "empty-state";
       item.textContent = "暂无受击记录";
     } else {
-      const position = Array.isArray(loss.position) ? ` @ ${loss.position[0]},${loss.position[1]}` : "";
       const result = loss.outcome === "DESTROYED" ? "摧毁" : "攻击";
       const attacker = loss.username ? `被 @${loss.username} ${result}` : `${result}者身份未公开`;
-      item.textContent = `t${loss.tick} ${loss.kind === "CORE" ? "Core" : "单位"} ${attacker}${position}`;
+      item.append(`t${loss.tick} ${loss.kind === "CORE" ? "Core" : "单位"} ${attacker}`);
+      if (Array.isArray(loss.position)) {
+        item.append(" @ ", coordLink(loss.position[0], loss.position[1]));
+      }
     }
     ui.losses.append(item);
   });
@@ -725,7 +897,9 @@ function renderControl() {
         ? order.unit_ids.map((id) => id.slice(0, 8)).join(", ")
         : "旧订单未指定单位";
       const summary = document.createElement("span");
-      summary.textContent = `#${order.id} ${order.unit_type} x${order.unit_count} → (${order.target_x},${order.target_y}) / ${order.status} / ${unitIds}`;
+      summary.append(`#${order.id} ${order.unit_type} x${order.unit_count} → (`);
+      summary.append(coordLink(order.target_x, order.target_y, `${order.target_x},${order.target_y}`));
+      summary.append(`) / ${order.status} / ${unitIds}`);
       item.append(summary);
       if (order.status === "PENDING") {
         const cancel = document.createElement("button");
@@ -753,7 +927,9 @@ function renderExpeditions() {
     } else {
       item.className = "order-item";
       const summary = document.createElement("span");
-      summary.textContent = `${expedition.enabled ? "启用" : "暂停"} · ${expedition.name} · ${expedition.ranger_count}R ${expedition.vanguard_count}V → (${expedition.target_x},${expedition.target_y})`;
+      summary.append(`${expedition.enabled ? "启用" : "暂停"} · ${expedition.name} · ${expedition.ranger_count}R ${expedition.vanguard_count}V → (`);
+      summary.append(coordLink(expedition.target_x, expedition.target_y, `${expedition.target_x},${expedition.target_y}`));
+      summary.append(")");
       const edit = document.createElement("button");
       edit.type = "button"; edit.dataset.editExpedition = expedition.id; edit.textContent = "编辑";
       const remove = document.createElement("button");
@@ -1034,6 +1210,16 @@ document.querySelector("#live-tick").addEventListener("click", () => selectIndex
 document.querySelector("#center-map").addEventListener("click", () => centerMap(true));
 document.querySelector("#zoom-in").addEventListener("click", () => { state.view.scale = Math.min(32, state.view.scale * 1.25); updateMetrics(); draw(); });
 document.querySelector("#zoom-out").addEventListener("click", () => { state.view.scale = Math.max(1.5, state.view.scale * 0.8); updateMetrics(); draw(); });
+ui.mapZoomIn.addEventListener("click", () => { state.view.scale = Math.min(32, state.view.scale * 1.25); updateMetrics(); draw(); });
+ui.mapZoomOut.addEventListener("click", () => { state.view.scale = Math.max(1.5, state.view.scale * 0.8); updateMetrics(); draw(); });
+ui.mapZoomHome.addEventListener("click", () => centerMap(true));
+ui.panelToggle.addEventListener("click", () => {
+  state.panelVisible = !state.panelVisible;
+  document.body.classList.toggle("panel-hidden", !state.panelVisible);
+  const title = state.panelVisible ? "隐藏右侧情报面板" : "显示右侧情报面板";
+  ui.panelToggle.title = title;
+  ui.panelToggle.setAttribute("aria-label", title);
+});
 ui.slider.addEventListener("input", () => selectIndex(Number(ui.slider.value)));
 document.querySelector("#events-tab").addEventListener("click", () => setPanel("events"));
 document.querySelector("#ranking-tab").addEventListener("click", () => setPanel("ranking"));
@@ -1231,6 +1417,10 @@ ui.expeditionList.addEventListener("click", async (event) => {
   } catch (error) {
     ui.expeditionStatus.textContent = `删除失败 · ${error.message}`;
   }
+});
+
+[ui.events, ui.kills, ui.losses, ui.orders, ui.expeditionList].forEach((list) => {
+  list.addEventListener("click", handleCoordClick);
 });
 
 new ResizeObserver(resizeCanvas).observe(canvas);
