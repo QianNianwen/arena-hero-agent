@@ -158,9 +158,13 @@ CORE_MOVE_COMMIT_PROGRESS = 2
 UNIT_EVADE_TRIGGER_DISTANCE = 5
 ASSAULT_REINFORCEMENT_RADIUS = UNIT_EVADE_TRIGGER_DISTANCE
 FULL_ASSAULT_HOSTILE_COUNT = 4
-BEACON_CAMPAIGN_POPULATION = 40
 BEACON_CAMPAIGN_RESOURCES = 30
-BEACON_RETURN_RADIUS = 3
+# The Beacon coordinate is public every Tick, so a carrier parked next to the
+# Core would broadcast it. Hold the Beacon at a still, low-exposure outpost this
+# far away instead, and only start a run the fleet can actually walk.
+BEACON_CAMPAIGN_MAX_DISTANCE = 80
+BEACON_OUTPOST_MIN_CORE_DISTANCE = 15
+BEACON_OUTPOST_SEARCH_RADIUS = 4
 RETREAT_MIN_BEACON_DISTANCE = 224
 COMBAT_PATROL_INITIAL_RADIUS = 24
 COMBAT_PATROL_GROWTH_TICKS = 64
@@ -217,6 +221,8 @@ SCOUT_STAGE_CYCLE = len(SCOUT_VECTORS)
 SCOUT_RING_STEP = 10
 SCOUT_RING_COUNT = 4
 SCOUT_COVERAGE_MEMORY_TTL = 4096
+SURVEY_MAX_CHUNKS = 1024
+CHUNK_SIZE = 32
 
 Position = tuple[int, int]
 
@@ -249,6 +255,22 @@ class GlobalPosture(str, Enum):
 
 def _chunk_coordinates(position: Position) -> Position:
     return position[0] // 32, position[1] // 32
+
+
+def _parse_survey_region(value: str) -> tuple[Position, Position]:
+    """Parse `x1,y1,x2,y2` into normalised inclusive corners."""
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 4:
+        raise ValueError("survey region must be 'x1,y1,x2,y2'")
+    try:
+        x1, y1, x2, y2 = (int(part) for part in parts)
+    except ValueError as error:
+        raise ValueError("survey region coordinates must be integers") from error
+    corners = ((min(x1, x2), min(y1, y2)), (max(x1, x2), max(y1, y2)))
+    for corner in corners:
+        if not _is_signed_int64_position(corner):
+            raise ValueError("survey region exceeds the signed 64-bit grid")
+    return corners
 
 
 def _chunk_axis(value: int) -> int:
@@ -2044,6 +2066,7 @@ class CoreFarmer:
         compatibility_marker: Path | None = DEFAULT_COMPATIBILITY_MARKER,
         alliance_coordinator: AllianceCoordinator | None = None,
         alliance_roster_client: AllianceRosterClient | None = None,
+        survey_region: tuple[Position, Position] | None = None,
     ) -> None:
         if not 1 <= worker_target <= MAX_WORKER_TARGET:
             raise ValueError(
@@ -2122,6 +2145,9 @@ class CoreFarmer:
         self.unit_hunt_vanguard_ids: set[UUID] = set()
         self.unit_hunt_ranger_ids: set[UUID] = set()
         self.beacon_runner_id: UUID | None = None
+        self.beacon_outpost_position: Position | None = None
+        self.survey_region = survey_region
+        self._survey_centers: tuple[Position, ...] | None = None
         self.threat_caution_until_tick = 0
         self.startup_tick: int | None = None
         self.manual_order_ids: tuple[int, ...] = ()
@@ -3676,6 +3702,74 @@ class CoreFarmer:
             self.scout_stages[worker_id] = 0
             used_slots.add(slot)
 
+    def _survey_centers_for_region(self) -> tuple[Position, ...]:
+        """Chunk centres covering the configured survey region.
+
+        Scout coverage is already tracked per chunk, so a region sweep is just
+        that memory restricted to the chunks the region touches. The list is
+        static for a given region, so it is computed once.
+        """
+        if self._survey_centers is not None:
+            return self._survey_centers
+        region = self.survey_region
+        if region is None:
+            self._survey_centers = ()
+            return self._survey_centers
+        (min_x, min_y), (max_x, max_y) = region
+        chunk_min = _chunk_coordinates((min_x, min_y))
+        chunk_max = _chunk_coordinates((max_x, max_y))
+        centers: list[Position] = []
+        truncated = False
+        for chunk_x in range(chunk_min[0], chunk_max[0] + 1):
+            for chunk_y in range(chunk_min[1], chunk_max[1] + 1):
+                if len(centers) >= SURVEY_MAX_CHUNKS:
+                    truncated = True
+                    break
+                center = (
+                    chunk_x * CHUNK_SIZE + CHUNK_SIZE // 2,
+                    chunk_y * CHUNK_SIZE + CHUNK_SIZE // 2,
+                )
+                if _is_signed_int64_position(center):
+                    centers.append(center)
+            if truncated:
+                break
+        if truncated:
+            print(
+                "SURVEY_REGION truncated "
+                f"chunks={len(centers)} limit={SURVEY_MAX_CHUNKS}",
+                flush=True,
+            )
+        self._survey_centers = tuple(centers)
+        return self._survey_centers
+
+    def _survey_target(
+        self,
+        core_position: Position,
+        *,
+        claim: bool = False,
+    ) -> Position | None:
+        """Least recently covered chunk centre inside the survey region."""
+        centers = self._survey_centers_for_region()
+        if not centers:
+            return None
+        unclaimed = tuple(
+            center for center in centers if center not in self.scout_claims
+        )
+        pool = unclaimed or centers
+        target = min(
+            pool,
+            key=lambda center: (
+                self.scout_chunk_last_seen.get(_chunk_coordinates(center), -1),
+                self.scout_target_last_visited.get(center, -1),
+                _distance(core_position, center),
+                center[0],
+                center[1],
+            ),
+        )
+        if claim:
+            self.scout_claims.add(target)
+        return target
+
     def _scout_target(
         self,
         worker_id: UUID,
@@ -3684,10 +3778,18 @@ class CoreFarmer:
         *,
         claim: bool = False,
     ) -> Position:
+        survey = self._survey_target(core_position, claim=claim)
+        if survey is not None:
+            return survey
         slot = self.scout_slots[worker_id]
         stage = self.scout_stages[worker_id]
         heading = (0, 0)
-        if beacon_position is not None and self.beacon_policy == "pursue":
+        if (
+            beacon_position is not None
+            and self.beacon_policy == "pursue"
+            and _distance(core_position, beacon_position)
+            <= BEACON_CAMPAIGN_MAX_DISTANCE
+        ):
             heading = (
                 (beacon_position[0] > core_position[0])
                 - (beacon_position[0] < core_position[0]),
@@ -4671,6 +4773,22 @@ class CoreFarmer:
             self.expedition_members[expedition_id] = members
         return tuple(orders)
 
+    def _friendly_beacon_carrier(self, turn: Turn) -> object | None:
+        carrier_id = turn.beacon.carrier_id
+        if carrier_id is None:
+            return None
+        return next(
+            (unit for unit in turn.units if unit.id == carrier_id),
+            None,
+        )
+
+    def _beacon_within_reach(self, turn: Turn) -> bool:
+        core = turn.core
+        return core is not None and (
+            _distance(core.position, turn.beacon.position)
+            <= BEACON_CAMPAIGN_MAX_DISTANCE
+        )
+
     def _beacon_campaign_ready(self, turn: Turn, target: object | None) -> bool:
         core = turn.core
         guard_vanguards, _ = _core_guard_ids(turn)
@@ -4681,7 +4799,7 @@ class CoreFarmer:
             and core.view.state is CoreState.NORMAL
             and core.hp == 5
             and core.shield >= 5
-            and len(turn.units) >= BEACON_CAMPAIGN_POPULATION
+            and self._beacon_within_reach(turn)
             and turn.resources >= BEACON_CAMPAIGN_RESOURCES
             and len(turn.vanguards) > len(guard_vanguards)
             and not self.threat_assessment.recent_core_attack
@@ -4689,6 +4807,13 @@ class CoreFarmer:
         )
 
     def _select_beacon_runner(self, turn: Turn, target: object | None) -> None:
+        carrier = self._friendly_beacon_carrier(turn)
+        if carrier is not None:
+            # Already holding it: the run is over and the outpost logic takes
+            # over, so distance and resource gates no longer apply.
+            self.beacon_runner_id = carrier.id
+            return
+        self.beacon_outpost_position = None
         if not self._beacon_campaign_ready(turn, target):
             self.beacon_runner_id = None
             return
@@ -4708,6 +4833,106 @@ class CoreFarmer:
                 _uuid_sort_key(unit),
             ),
         ).id
+
+    @staticmethod
+    def _beacon_cell_exposure(cell: Position, obstacles: set[Position]) -> int:
+        """Count the cells a Ranger could legally fire into `cell` from.
+
+        Only obstacles block a shot, so this is the number of open blind-fire
+        lanes onto a carrier standing here. Zero means terrain fully denies the
+        eight-direction range 1-3 envelope.
+        """
+        exposure = 0
+        for dx, dy in RANGER_LINE_VECTORS:
+            for distance in range(1, 4):
+                shooter = (cell[0] + dx * distance, cell[1] + dy * distance)
+                if shooter in obstacles:
+                    break
+                exposure += 1
+        return exposure
+
+    def _beacon_outpost_valid(
+        self,
+        cell: Position,
+        core_position: Position,
+        context: MovementContext,
+    ) -> bool:
+        return (
+            _is_signed_int64_position(cell)
+            and _distance(cell, core_position)
+            >= BEACON_OUTPOST_MIN_CORE_DISTANCE
+            and cell not in context.obstacles
+            and cell not in context.enemy_cells
+            and cell not in context.danger_cells
+            and cell not in context.allied_cells
+        )
+
+    def _beacon_outpost_position(
+        self,
+        turn: Turn,
+        carrier: object,
+        context: MovementContext,
+    ) -> Position:
+        """Choose a still, low-exposure cell well away from the Core.
+
+        A static Beacon coordinate is indistinguishable from one lying on the
+        ground, so holding still hides that anyone is carrying it. Standing
+        still also makes the carrier a fixed blind-fire target, so prefer cells
+        whose eight-direction firing lanes terrain already blocks.
+        """
+        core = turn.core
+        if core is None:
+            return carrier.position
+        cached = self.beacon_outpost_position
+        if cached is not None and self._beacon_outpost_valid(
+            cached,
+            core.position,
+            context,
+        ):
+            return cached
+
+        best: tuple[object, ...] | None = None
+        best_cell: Position | None = None
+        for dx in range(
+            -BEACON_OUTPOST_SEARCH_RADIUS,
+            BEACON_OUTPOST_SEARCH_RADIUS + 1,
+        ):
+            for dy in range(
+                -BEACON_OUTPOST_SEARCH_RADIUS,
+                BEACON_OUTPOST_SEARCH_RADIUS + 1,
+            ):
+                cell = (carrier.position[0] + dx, carrier.position[1] + dy)
+                if not self._beacon_outpost_valid(cell, core.position, context):
+                    continue
+                if cell != carrier.position and context.friendly_counts[cell] >= 2:
+                    continue
+                key = (
+                    self._beacon_cell_exposure(cell, context.obstacles),
+                    _distance(carrier.position, cell),
+                    cell,
+                )
+                if best is None or key < best:
+                    best = key
+                    best_cell = cell
+        if best_cell is not None:
+            self.beacon_outpost_position = best_cell
+            return best_cell
+
+        # Still inside the Core's broadcast radius: walk directly outward until
+        # a legal outpost comes into range.
+        away = (
+            carrier.position[0] - core.position[0],
+            carrier.position[1] - core.position[1],
+        )
+        if away == (0, 0):
+            away = (1, 0)
+        norm = abs(away[0]) + abs(away[1])
+        scale = -(-(BEACON_OUTPOST_MIN_CORE_DISTANCE + 2) // norm)
+        target = (
+            core.position[0] + away[0] * scale,
+            core.position[1] + away[1] * scale,
+        )
+        return target if _is_signed_int64_position(target) else carrier.position
 
     def _combat_patrol_target(
         self,
@@ -5582,10 +5807,15 @@ class CoreFarmer:
                 continue
             if vanguard.id == self.beacon_runner_id:
                 if turn.beacon.carrier_id == vanguard.id:
-                    if (
-                        _distance(vanguard.position, core.position)
-                        > BEACON_RETURN_RADIUS
-                        and _queue_toward(vanguard, core.position, context)
+                    outpost = self._beacon_outpost_position(
+                        turn,
+                        vanguard,
+                        context,
+                    )
+                    if outpost != vanguard.position and _queue_toward(
+                        vanguard,
+                        outpost,
+                        context,
                     ):
                         continue
                     vanguard.wait()
@@ -7115,6 +7345,7 @@ def _position_diagnostics(turn: Turn, tactic: CoreFarmer) -> str:
         f"delivery_blocked={delivery_blocked} "
         f"resource_blocked={resource_blocked} "
         f"scout_chunks={len(tactic.scout_chunk_last_seen)} "
+        f"survey_chunks={len(tactic._survey_centers_for_region())} "
         f"scout_oldest_age={scout_oldest_age} "
         f"captured_resources={captured_resources} "
         f"capture_destroyed={capture_destroyed} "
@@ -7309,6 +7540,7 @@ def play(
     alliance_roster_token_file: Path | None = None,
     alliance_roster_refresh_seconds: float = 15.0,
     alliance_roster_timeout_seconds: float = 5.0,
+    survey_region: tuple[Position, Position] | None = None,
 ) -> None:
     if (
         not math.isfinite(stale_turn_timeout_seconds)
@@ -7362,6 +7594,7 @@ def play(
         compatibility_marker=compatibility_marker,
         alliance_coordinator=alliance_coordinator,
         alliance_roster_client=alliance_roster_client,
+        survey_region=survey_region,
     )
     last_accepted_tick: int | None = None
     resource_ledger_snapshot: ResourceLedgerSnapshot | None = None
@@ -7546,6 +7779,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("hold", "pursue", "retreat"),
         default=DEFAULT_BEACON_POLICY,
     )
+    parser.add_argument(
+        "--survey-region",
+        type=_parse_survey_region,
+        default=None,
+        metavar="X1,Y1,X2,Y2",
+        help=(
+            "Sweep Workers across the chunks covering this rectangle, "
+            "least recently seen first, instead of the outward scout rays."
+        ),
+    )
     marker_group = parser.add_mutually_exclusive_group()
     marker_group.add_argument(
         "--compatibility-marker",
@@ -7645,6 +7888,7 @@ def main(argv: list[str] | None = None) -> int:
             base_url=args.base_url,
             worker_target=args.worker_target,
             beacon_policy=args.beacon_policy,
+            survey_region=args.survey_region,
             compatibility_marker=args.compatibility_marker,
             heartbeat_file=args.heartbeat_file,
             history_db=args.history_db,

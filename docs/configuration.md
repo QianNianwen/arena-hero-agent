@@ -15,6 +15,7 @@ The Agent reads credentials in this order:
 | `--env-file` | `.env` | Explicit credential file. |
 | `--worker-target` | `18` | Worker goal; accepted range is 1-18. |
 | `--beacon-policy` | `pursue` | `hold`, `pursue`, or `retreat`; `pursue` is the aggressive default. |
+| `--survey-region` | none | `X1,Y1,X2,Y2`. Sweep Workers across the chunks covering this rectangle, least recently seen first, instead of the outward scout rays. |
 | `--compatibility-marker` | systemd marker path | Enter compatibility hold while the file exists. |
 | `--no-compatibility-marker` | off | Disable marker checks for local/container runs. |
 | `--heartbeat-file` | none | Write liveness metadata after each accepted Turn. |

@@ -30,6 +30,8 @@ from arena_farmer import (
     CoreFarmer,
     GlobalPosture,
     LifecycleMode,
+    _chunk_coordinates,
+    _parse_survey_region,
     ResourceLedgerSnapshot,
     ThreatLevel,
     _emit_resource_ledger,
@@ -133,6 +135,7 @@ def make_turn(
     move_destination: tuple[int, int] | None = None,
     beacon_position: tuple[int, int] = (0, 0),
     beacon_status: str | None = None,
+    beacon_carrier: str | None = None,
     units: list[dict[str, object]] | None = None,
     enemies: list[dict[str, object]] | None = None,
     resource_cells: list[tuple[int, int]] | None = None,
@@ -176,6 +179,8 @@ def make_turn(
     beacon: dict[str, object] = {"position": list(beacon_position)}
     if beacon_status is not None:
         beacon["status"] = beacon_status
+    if beacon_carrier is not None:
+        beacon["carrier_id"] = beacon_carrier
 
     state = PlayerState.model_validate(
         {
@@ -881,6 +886,259 @@ class EmergencySwapTests(unittest.TestCase):
             self.assertNotEqual(core_action.get("type"), "SPAWN")
         for action in queued["unit_actions"].values():
             self.assertNotEqual(action["type"], "SELF_DESTRUCT")
+
+
+class BeaconOutpostTests(unittest.TestCase):
+    @staticmethod
+    def _fleet() -> list[dict[str, object]]:
+        return [
+            unit(WORKER_1, "WORKER", (5, 5), cargo=0),
+            unit(VANGUARD_1, "VANGUARD", (1, 0)),
+            unit(VANGUARD_2, "VANGUARD", (2, 0)),
+            unit(RANGER_1, "RANGER", (0, 1)),
+        ]
+
+    def test_small_fleet_runs_at_a_reachable_beacon(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="pursue")
+        turn = make_turn(
+            tick=100,
+            resources=30,
+            beacon_position=(10, 0),
+            beacon_status="GROUND",
+            units=self._fleet(),
+        )
+
+        tactic.choose_actions(turn)
+
+        self.assertIsNotNone(tactic.beacon_runner_id)
+
+    def test_unreachable_beacon_cancels_the_campaign(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="pursue")
+        turn = make_turn(
+            tick=100,
+            resources=30,
+            beacon_position=(400, 0),
+            beacon_status="GROUND",
+            units=self._fleet(),
+        )
+
+        tactic.choose_actions(turn)
+
+        self.assertIsNone(tactic.beacon_runner_id)
+
+    def test_unreachable_beacon_does_not_steer_scouts(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="pursue")
+        turn = make_turn(
+            tick=100,
+            resources=10,
+            beacon_position=(400, 0),
+            units=[unit(WORKER_1, "WORKER", (0, 1), cargo=0)],
+        )
+
+        tactic.choose_actions(turn)
+        target = tactic.worker_targets[UUID(WORKER_1)]
+
+        self.assertLess(target[0], 400)
+
+    def test_carrier_leaves_the_core_instead_of_nesting_on_it(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="pursue")
+        turn = make_turn(
+            tick=100,
+            resources=30,
+            beacon_position=(1, 0),
+            beacon_status="CARRIED",
+            beacon_carrier=VANGUARD_1,
+            units=self._fleet(),
+        )
+
+        tactic.choose_actions(turn)
+        queued = turn.plan.model_dump(mode="json", exclude_none=True)
+
+        self.assertEqual(tactic.beacon_runner_id, UUID(VANGUARD_1))
+        self.assertEqual(queued["unit_actions"][VANGUARD_1]["type"], "MOVE")
+
+    def test_carrier_holds_still_at_a_distant_outpost(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="pursue")
+        carrier = unit(VANGUARD_1, "VANGUARD", (40, 0))
+        turn = make_turn(
+            tick=100,
+            resources=30,
+            beacon_position=(40, 0),
+            beacon_status="CARRIED",
+            beacon_carrier=VANGUARD_1,
+            units=[
+                unit(WORKER_1, "WORKER", (5, 5), cargo=0),
+                carrier,
+                unit(VANGUARD_2, "VANGUARD", (2, 0)),
+                unit(RANGER_1, "RANGER", (0, 1)),
+            ],
+        )
+
+        tactic.choose_actions(turn)
+        queued = turn.plan.model_dump(mode="json", exclude_none=True)
+
+        self.assertEqual(queued["unit_actions"][VANGUARD_1]["type"], "WAIT")
+
+    def test_held_beacon_keeps_its_runner_past_the_distance_gate(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="pursue")
+        turn = make_turn(
+            tick=100,
+            resources=0,
+            beacon_position=(400, 0),
+            beacon_status="CARRIED",
+            beacon_carrier=VANGUARD_1,
+            units=[
+                unit(WORKER_1, "WORKER", (5, 5), cargo=0),
+                unit(VANGUARD_1, "VANGUARD", (400, 0)),
+                unit(VANGUARD_2, "VANGUARD", (2, 0)),
+                unit(RANGER_1, "RANGER", (0, 1)),
+            ],
+        )
+
+        tactic.choose_actions(turn)
+
+        self.assertEqual(tactic.beacon_runner_id, UUID(VANGUARD_1))
+
+    def test_outpost_prefers_terrain_that_blocks_firing_lanes(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="pursue")
+        sheltered = (40, 0)
+        obstacles = [
+            (sheltered[0] + dx * step, sheltered[1] + dy * step)
+            for dx, dy in (
+                (0, -1),
+                (1, -1),
+                (1, 0),
+                (1, 1),
+                (0, 1),
+                (-1, 1),
+                (-1, 0),
+                (-1, -1),
+            )
+            for step in (1,)
+        ]
+        turn = make_turn(
+            tick=100,
+            resources=30,
+            beacon_position=(42, 0),
+            beacon_status="CARRIED",
+            beacon_carrier=VANGUARD_1,
+            units=[
+                unit(WORKER_1, "WORKER", (5, 5), cargo=0),
+                unit(VANGUARD_1, "VANGUARD", (42, 0)),
+                unit(VANGUARD_2, "VANGUARD", (2, 0)),
+                unit(RANGER_1, "RANGER", (0, 1)),
+            ],
+            obstacles=obstacles,
+        )
+
+        tactic.choose_actions(turn)
+
+        self.assertEqual(
+            tactic._beacon_cell_exposure(sheltered, set(obstacles)),
+            0,
+        )
+        self.assertIsNotNone(tactic.beacon_outpost_position)
+        self.assertEqual(
+            tactic._beacon_cell_exposure(
+                tactic.beacon_outpost_position,
+                set(obstacles),
+            ),
+            0,
+        )
+
+
+class SurveyRegionTests(unittest.TestCase):
+    REGION = ((100, 100), (220, 160))
+
+    def test_parses_and_normalises_corners(self) -> None:
+        self.assertEqual(
+            _parse_survey_region("220,160,100,100"),
+            ((100, 100), (220, 160)),
+        )
+
+    def test_rejects_malformed_regions(self) -> None:
+        for bad in ("1,2,3", "a,b,c,d", ""):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    _parse_survey_region(bad)
+
+    def test_region_covers_every_touched_chunk(self) -> None:
+        tactic = CoreFarmer(worker_target=1, survey_region=self.REGION)
+        centers = tactic._survey_centers_for_region()
+
+        chunks = {_chunk_coordinates(c) for c in centers}
+        self.assertEqual(
+            chunks,
+            {(x, y) for x in range(3, 7) for y in range(3, 6)},
+        )
+
+    def test_scout_targets_land_inside_the_region(self) -> None:
+        tactic = CoreFarmer(worker_target=1, survey_region=self.REGION)
+        turn = make_turn(
+            tick=100,
+            resources=10,
+            core_position=(0, 0),
+            units=[unit(WORKER_1, "WORKER", (1, 0), cargo=0)],
+        )
+
+        tactic.choose_actions(turn)
+        target = tactic.worker_targets[UUID(WORKER_1)]
+
+        self.assertGreaterEqual(target[0], 96)
+        self.assertLessEqual(target[0], 223)
+        self.assertGreaterEqual(target[1], 96)
+        self.assertLessEqual(target[1], 191)
+
+    def test_scouts_spread_across_distinct_chunks(self) -> None:
+        tactic = CoreFarmer(worker_target=4, survey_region=self.REGION)
+        workers = [
+            unit(identifier, "WORKER", (index + 1, 0), cargo=0)
+            for index, identifier in enumerate(
+                (WORKER_1, WORKER_2, WORKER_3, WORKER_4)
+            )
+        ]
+        turn = make_turn(
+            tick=100,
+            resources=10,
+            core_position=(0, 0),
+            units=workers,
+        )
+
+        tactic.choose_actions(turn)
+        targets = [
+            tactic.worker_targets[UUID(identifier)]
+            for identifier in (WORKER_1, WORKER_2, WORKER_3, WORKER_4)
+        ]
+
+        self.assertEqual(len(set(targets)), len(targets))
+
+    def test_covered_chunks_yield_to_stale_ones(self) -> None:
+        tactic = CoreFarmer(worker_target=1, survey_region=self.REGION)
+        centers = tactic._survey_centers_for_region()
+        stale = centers[-1]
+        for center in centers:
+            tactic.scout_chunk_last_seen[
+                _chunk_coordinates(center)
+            ] = 500
+        tactic.scout_chunk_last_seen[
+            _chunk_coordinates(stale)
+        ] = 1
+
+        self.assertEqual(tactic._survey_target((0, 0)), stale)
+
+    def test_no_region_keeps_the_outward_ray_behaviour(self) -> None:
+        tactic = CoreFarmer(worker_target=1)
+        turn = make_turn(
+            tick=100,
+            resources=10,
+            core_position=(0, 0),
+            units=[unit(WORKER_1, "WORKER", (1, 0), cargo=0)],
+        )
+
+        tactic.choose_actions(turn)
+
+        self.assertEqual(tactic._survey_centers_for_region(), ())
+        self.assertIn(UUID(WORKER_1), tactic.worker_targets)
 
 
 class CoreFarmerTests(unittest.TestCase):

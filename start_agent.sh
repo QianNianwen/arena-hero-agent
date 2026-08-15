@@ -10,6 +10,7 @@ ENV_FILE=".env"
 LOG_FILE="arena_farmer.log"
 WORKER_TARGET=18
 BEACON_POLICY="pursue"
+SURVEY_REGION=""
 HISTORY_DB="arena_history.sqlite3"
 BASE_URL=""
 DASHBOARD_PORT=8765
@@ -34,6 +35,7 @@ while [[ $# -gt 0 ]]; do
     --log-file) LOG_FILE="$2"; shift 2 ;;
     --worker-target) WORKER_TARGET="$2"; shift 2 ;;
     --beacon-policy) BEACON_POLICY="$2"; shift 2 ;;
+    --survey-region) SURVEY_REGION="$2"; shift 2 ;;
     --history-db) HISTORY_DB="$2"; shift 2 ;;
     --base-url) BASE_URL="$2"; shift 2 ;;
     --dashboard-port) DASHBOARD_PORT="$2"; shift 2 ;;
@@ -127,6 +129,9 @@ AGENT_ARGS=(
 )
 if [ -n "$BASE_URL" ]; then
     AGENT_ARGS+=("--base-url" "$BASE_URL")
+fi
+if [ -n "$SURVEY_REGION" ]; then
+    AGENT_ARGS+=("--survey-region" "$SURVEY_REGION")
 fi
 if [ "$NO_COMPATIBILITY_MARKER" = true ]; then
     AGENT_ARGS+=("--no-compatibility-marker")

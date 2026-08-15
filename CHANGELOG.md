@@ -22,9 +22,17 @@ All notable changes to this project will be documented in this file. The format 
   self-destruct one empty, most-exposed Worker and spawn a combat Unit in the
   same Tick, priced with the reduced population and guarded by a Worker floor,
   cargo and Beacon-carrier exclusions, and heal-priority checks.
+- `--survey-region X1,Y1,X2,Y2` sweeps Workers across the chunks covering a
+  rectangle, least recently seen first, reusing the existing per-chunk coverage
+  memory instead of the outward scout rays.
 
 ### Changed
 
+- The Beacon campaign is gated on travel distance and a spare escort instead of
+  a 40-Unit population floor, and a carrier now holds the Beacon still at a
+  low-exposure outpost away from the Core rather than returning to it, because
+  the Beacon coordinate is public every Tick. `pursue` no longer skews scout
+  rays toward a Beacon the fleet cannot reach.
 - The Docker base image is pinned to an immutable multi-architecture digest.
 - GitHub Actions are pinned to full commit SHAs while retaining their reviewed major-version annotations.
 - systemd upgrades now preflight host requirements, restart the Agent after compatibility validation, and support explicit supervisor, AI, and optimizer disable paths.
