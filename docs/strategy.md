@@ -47,6 +47,13 @@ One Vanguard and one Ranger remain as Core guards. Other combat units join the
 strike group. When there is no visible target, non-guard units follow
 deterministic outward patrol sectors whose radius grows with elapsed Ticks.
 
+At the fleet cap, an active Core defense may trade one empty Worker for a
+combat Unit in the same Tick: the Worker self-destruct resolves before combat,
+so the spawn is priced with the reduced population. The swap keeps a minimum
+Worker floor, never selects cargo carriers, the Beacon carrier, or the raid
+observer, and cancels itself whenever healing must take the Core action or the
+Core cell is blocked.
+
 ## Beacon Campaign
 
 The Beacon campaign starts only when all of these are true:

@@ -744,6 +744,145 @@ class DynamicPricingTests(unittest.TestCase):
                 )
 
 
+class EmergencySwapTests(unittest.TestCase):
+    @staticmethod
+    def _combat_fleet(vanguards: int, rangers: int) -> list[dict[str, object]]:
+        units = [
+            unit(
+                f"30000000-0000-4000-8000-{index:012x}",
+                "VANGUARD",
+                (20 + index, 20),
+            )
+            for index in range(vanguards)
+        ]
+        units.extend(
+            unit(
+                f"40000000-0000-4000-8000-{index:012x}",
+                "RANGER",
+                (20 + index, 22),
+            )
+            for index in range(rangers)
+        )
+        return units
+
+    def test_population_cap_swaps_exposed_worker_for_vanguard(self) -> None:
+        turn = make_turn(
+            tick=100,
+            resources=30,
+            units=[
+                unit(WORKER_1, "WORKER", (5, 5), cargo=0),
+                unit(WORKER_2, "WORKER", (4, 0), cargo=0),
+            ]
+            + self._combat_fleet(14, 16),
+            enemies=[unit(ENEMY_1, "RANGER", (3, 0), controlled=False)],
+        )
+
+        CoreFarmer(worker_target=1, beacon_policy="hold").choose_actions(turn)
+        queued = turn.plan.model_dump(mode="json", exclude_none=True)
+
+        self.assertEqual(
+            queued["core_action"],
+            {"type": "SPAWN", "unit_type": "VANGUARD"},
+        )
+        self.assertEqual(
+            queued["unit_actions"][WORKER_2],
+            {"type": "SELF_DESTRUCT"},
+        )
+        self.assertNotEqual(
+            queued["unit_actions"].get(WORKER_1, {}).get("type"),
+            "SELF_DESTRUCT",
+        )
+
+    def test_swap_prices_spawn_with_reduced_population(self) -> None:
+        turn = make_turn(
+            tick=100,
+            resources=22,
+            units=[
+                unit(WORKER_1, "WORKER", (5, 5), cargo=0),
+                unit(WORKER_2, "WORKER", (4, 0), cargo=0),
+                unit(WORKER_3, "WORKER", (6, 6), cargo=0),
+                unit(WORKER_4, "WORKER", (7, 7), cargo=0),
+                unit(WORKER_5, "WORKER", (8, 8), cargo=0),
+            ]
+            + self._combat_fleet(14, 16),
+            enemies=[unit(ENEMY_1, "RANGER", (3, 0), controlled=False)],
+        )
+
+        CoreFarmer(worker_target=1, beacon_policy="hold").choose_actions(turn)
+        queued = turn.plan.model_dump(mode="json", exclude_none=True)
+
+        self.assertEqual(
+            queued["core_action"],
+            {"type": "SPAWN", "unit_type": "VANGUARD"},
+        )
+        self.assertEqual(
+            queued["unit_actions"][WORKER_2],
+            {"type": "SELF_DESTRUCT"},
+        )
+
+    def test_swap_skips_cargo_workers(self) -> None:
+        turn = make_turn(
+            tick=100,
+            resources=30,
+            units=[
+                unit(WORKER_1, "WORKER", (4, 0), cargo=1),
+                unit(WORKER_2, "WORKER", (5, 5), cargo=0),
+            ]
+            + self._combat_fleet(14, 16),
+            enemies=[unit(ENEMY_1, "RANGER", (3, 0), controlled=False)],
+        )
+
+        CoreFarmer(worker_target=1, beacon_policy="hold").choose_actions(turn)
+        queued = turn.plan.model_dump(mode="json", exclude_none=True)
+
+        self.assertEqual(
+            queued["unit_actions"][WORKER_2],
+            {"type": "SELF_DESTRUCT"},
+        )
+        self.assertNotEqual(
+            queued["unit_actions"].get(WORKER_1, {}).get("type"),
+            "SELF_DESTRUCT",
+        )
+
+    def test_swap_respects_minimum_worker_floor(self) -> None:
+        turn = make_turn(
+            tick=100,
+            resources=30,
+            units=[unit(WORKER_1, "WORKER", (5, 5), cargo=0)]
+            + self._combat_fleet(14, 16),
+            enemies=[unit(ENEMY_1, "RANGER", (3, 0), controlled=False)],
+        )
+
+        CoreFarmer(worker_target=1, beacon_policy="hold").choose_actions(turn)
+        queued = turn.plan.model_dump(mode="json", exclude_none=True)
+
+        core_action = queued.get("core_action")
+        if core_action is not None:
+            self.assertNotEqual(core_action.get("type"), "SPAWN")
+        for action in queued["unit_actions"].values():
+            self.assertNotEqual(action["type"], "SELF_DESTRUCT")
+
+    def test_swap_requires_active_defense(self) -> None:
+        turn = make_turn(
+            tick=100,
+            resources=30,
+            units=[
+                unit(WORKER_1, "WORKER", (5, 5), cargo=0),
+                unit(WORKER_2, "WORKER", (4, 0), cargo=0),
+            ]
+            + self._combat_fleet(14, 16),
+        )
+
+        CoreFarmer(worker_target=1, beacon_policy="hold").choose_actions(turn)
+        queued = turn.plan.model_dump(mode="json", exclude_none=True)
+
+        core_action = queued.get("core_action")
+        if core_action is not None:
+            self.assertNotEqual(core_action.get("type"), "SPAWN")
+        for action in queued["unit_actions"].values():
+            self.assertNotEqual(action["type"], "SELF_DESTRUCT")
+
+
 class CoreFarmerTests(unittest.TestCase):
     def test_production_weights_choose_largest_ratio_deficit(self) -> None:
         tactic = CoreFarmer(worker_target=18, beacon_policy="hold")

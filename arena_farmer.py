@@ -135,6 +135,7 @@ SCOUT_STALL_TICKS = 3
 RECOVERY_TICKS = 160
 RECOVERY_MIN_WORKERS = 8
 RECOVERY_MIN_RESOURCES = 20
+EMERGENCY_SWAP_MIN_WORKERS = 8
 RECOVERY_THREAT_DISTANCE = 12
 RECOVERY_INFERENCE_RESOURCE_LIMIT = CORE_RESOURCE_RESERVE + unit_cost(
     UnitType.WORKER,
@@ -2128,6 +2129,7 @@ class CoreFarmer:
         self.expedition_members: dict[int, set[UUID]] = {}
         self.revenge_usernames: set[str] = set()
         self.manual_core_order_active = False
+        self.emergency_swap_worker_id: UUID | None = None
 
     def _refresh_alliance(self, turn: Turn) -> None:
         coordinator = self.alliance_coordinator
@@ -4006,6 +4008,7 @@ class CoreFarmer:
 
     def choose_actions(self, turn: Turn) -> None:
         turn.clear()
+        self.emergency_swap_worker_id = None
         self._refresh_alliance(turn)
         if not self.alliance_ready:
             if turn.core is not None:
@@ -4225,6 +4228,24 @@ class CoreFarmer:
             else:
                 mode = "DELIVERY_CHAIN_CLEAR"
             self._set_worker_mode(worker, mode, core.position)
+        if spawn_reservation in {UnitType.VANGUARD, UnitType.RANGER}:
+            swap_worker = self._select_emergency_swap_worker(
+                turn,
+                mobile_enemies,
+                retreat_enemies,
+                preplanned_units,
+                core_cell_occupants=context.friendly_counts[core.position],
+            )
+            if swap_worker is not None:
+                swap_worker.self_destruct()
+                self.emergency_swap_worker_id = swap_worker.id
+                preplanned_units.add(swap_worker.id)
+                context.friendly_counts[swap_worker.position] -= 1
+                self._set_worker_mode(
+                    swap_worker,
+                    "EMERGENCY_SWAP",
+                    core.position,
+                )
         self._refresh_resource_memory(turn)
         resource_route_blocked = (
             set(context.obstacles)
@@ -6405,6 +6426,101 @@ class CoreFarmer:
             self.last_core_cancel_reason = "BEACON_APPROACH"
         return cancel_for_beacon
 
+    def _population_cap(self) -> int:
+        return (
+            self.worker_target
+            + DEFENSE_VANGUARD_TARGET
+            + DEFENSE_RANGER_TARGET
+        )
+
+    def _emergency_swap_candidates(
+        self,
+        turn: Turn,
+        excluded_ids: set[UUID] | None = None,
+    ) -> tuple[object, ...]:
+        excluded = excluded_ids if excluded_ids is not None else set()
+        return tuple(
+            worker
+            for worker in turn.workers
+            if worker.cargo == 0
+            and worker.id != turn.beacon.carrier_id
+            and worker.id != self.core_raid_spotter_id
+            and worker.id not in excluded
+        )
+
+    def _emergency_swap_possible(self, turn: Turn) -> bool:
+        return (
+            len(turn.workers)
+            > min(EMERGENCY_SWAP_MIN_WORKERS, self.worker_target)
+            and bool(self._emergency_swap_candidates(turn))
+        )
+
+    def _select_emergency_swap_worker(
+        self,
+        turn: Turn,
+        mobile_enemies: Sequence[object],
+        retreat_enemies: Sequence[object],
+        excluded_ids: set[UUID],
+        *,
+        core_cell_occupants: int,
+    ) -> object | None:
+        """Pick the Worker traded for an emergency combat spawn at the cap.
+
+        A Unit self-destruct resolves before movement and combat, so the spawn
+        later in the same Tick is priced with the reduced population. Swap only
+        when the Core action will really be the spawn: a projected shield
+        breach hands the Core action to HEAL, and a blocked Core cell defers
+        the spawn, so both cancel the sacrifice.
+        """
+        core = turn.core
+        if (
+            core is None
+            or len(turn.units) < self._population_cap()
+            or not self._emergency_swap_possible(turn)
+        ):
+            return None
+        nearest_threat = min(
+            (
+                _distance(core.position, enemy.position)
+                for enemy in retreat_enemies
+            ),
+            default=None,
+        )
+        if not self._core_defense_active(nearest_threat):
+            return None
+        if (
+            _projected_core_damage(
+                core.position,
+                mobile_enemies,
+                self.known_obstacles,
+            )
+            > core.shield
+        ):
+            return None
+        candidates = self._emergency_swap_candidates(turn, excluded_ids)
+        if core_cell_occupants >= 2:
+            candidates = tuple(
+                worker
+                for worker in candidates
+                if worker.position == core.position
+            )
+        if not candidates:
+            return None
+
+        def exposure(worker: object) -> int:
+            return min(
+                (
+                    _distance(worker.position, enemy.position)
+                    for enemy in retreat_enemies
+                ),
+                default=SIGNED_INT64_MAX,
+            )
+
+        return min(
+            candidates,
+            key=lambda worker: (exposure(worker), _uuid_sort_key(worker)),
+        )
+
     def _spawn_unit_type(
         self,
         turn: Turn,
@@ -6418,12 +6534,13 @@ class CoreFarmer:
         ):
             return None
         population = len(turn.units)
-        target_population = (
-            self.worker_target
-            + DEFENSE_VANGUARD_TARGET
-            + DEFENSE_RANGER_TARGET
+        emergency_spawn = self._core_defense_active(nearest_threat)
+        swap_spawn = (
+            population >= self._population_cap()
+            and emergency_spawn
+            and self._emergency_swap_possible(turn)
         )
-        if population >= target_population:
+        if population >= self._population_cap() and not swap_spawn:
             return None
 
         next_unit = _next_force_unit_type(
@@ -6432,10 +6549,9 @@ class CoreFarmer:
             len(turn.vanguards),
             len(turn.rangers),
         )
-        if next_unit is None:
+        if next_unit is None and not swap_spawn:
             return None
 
-        emergency_spawn = self._core_defense_active(nearest_threat)
         if emergency_spawn:
             guard_vanguards, guard_rangers = _core_guard_ids(turn)
             local_vanguards = sum(
@@ -6518,9 +6634,10 @@ class CoreFarmer:
             )
             else CORE_RESOURCE_RESERVE
         )
+        pricing_population = population - 1 if swap_spawn else population
         threshold = min(
             turn.resource_capacity,
-            reserve + unit_cost(next_unit, population),
+            reserve + unit_cost(next_unit, pricing_population),
         )
         return next_unit if turn.resources >= threshold else None
 
@@ -6663,6 +6780,12 @@ class CoreFarmer:
             return
 
         next_unit = self._spawn_unit_type(turn, nearest_threat)
+        if (
+            next_unit is not None
+            and len(turn.units) >= self._population_cap()
+            and self.emergency_swap_worker_id is None
+        ):
+            next_unit = None
         if (
             can_spawn
             and core.hp == 5
@@ -7028,6 +7151,7 @@ def _position_diagnostics(turn: Turn, tactic: CoreFarmer) -> str:
         f"scout_return={len(tactic.scout_return_ids)} "
         f"squad_disengage_until={tactic.squad_disengage_until_tick} "
         f"healing_defenders={len(tactic.healing_defender_ids)} "
+        f"emergency_swap={int(tactic.emergency_swap_worker_id is not None)} "
         f"compatibility_hold={int(tactic.compatibility_hold)} "
         f"threat_caution_until={tactic.threat_caution_until_tick} "
         f"core_cancel_reason={tactic.last_core_cancel_reason} "

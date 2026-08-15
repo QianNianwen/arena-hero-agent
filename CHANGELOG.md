@@ -18,6 +18,10 @@ All notable changes to this project will be documented in this file. The format 
 - Gameplay v0.14 and official SDK 0.2.9 compatibility, including dynamic Unit-price boundary tests and authoritative spawn-cost reconciliation.
 - Bounded SQLite Turn history and a local tactical dashboard with historical
   vision, unit trails, enemy Core memory, events, and public leaderboards.
+- Emergency population-cap swap: an active Core defense at the fleet cap may
+  self-destruct one empty, most-exposed Worker and spawn a combat Unit in the
+  same Tick, priced with the reduced population and guarded by a Worker floor,
+  cargo and Beacon-carrier exclusions, and heal-priority checks.
 
 ### Changed
 
