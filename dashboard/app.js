@@ -40,6 +40,9 @@ const ui = {
   mapZoomIn: document.querySelector("#map-zoom-in"),
   mapZoomOut: document.querySelector("#map-zoom-out"),
   mapZoomHome: document.querySelector("#map-zoom-home"),
+  unitsPanel: document.querySelector("#units-panel"),
+  unitsPanelToggle: document.querySelector("#units-panel-toggle"),
+  unitList: document.querySelector("#unit-list"),
   allianceForm: document.querySelector("#alliance-form"),
   allianceStatus: document.querySelector("#alliance-status"),
   expeditionForm: document.querySelector("#expedition-form"),
@@ -90,6 +93,7 @@ const state = {
   unitFilter: "ALL",
   useRelativeCoords: false,
   panelVisible: true,
+  unitsPanelVisible: true,
   legendVisible: true,
   flashTarget: null,
 };
@@ -962,6 +966,91 @@ function renderExpeditions() {
   });
 }
 
+const UNIT_TYPE_ORDER = { CORE: 0, WORKER: 1, VANGUARD: 2, RANGER: 3 };
+
+function formatUnitAction(action) {
+  if (!action) return "—";
+  if (action.type === "MOVE" && action.direction) {
+    const labels = { UP: "上", DOWN: "下", LEFT: "左", RIGHT: "右" };
+    return `移动${labels[action.direction] || action.direction}`;
+  }
+  if (action.type === "ATTACK") return "攻击";
+  if (action.type === "GATHER") return "采集";
+  if (action.type === "RETURN") return "返程";
+  if (action.type === "IDLE") return "待机";
+  return action.type;
+}
+
+function setUnitFilter(filter) {
+  state.unitFilter = filter;
+  document.querySelectorAll("[data-unit-filter]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.unitFilter === filter);
+  });
+  draw();
+  renderUnitList();
+}
+
+function renderUnitList() {
+  if (!ui.unitList) return;
+  ui.unitList.replaceChildren();
+  const objects = state.overview?.state?.objects || [];
+  const actions = state.overview?.plan?.unit_actions || {};
+  const units = objects
+    .filter((item) => item.controlled === true && ["CORE", "UNIT"].includes(item.kind))
+    .sort((left, right) => {
+      const leftKind = left.kind === "CORE" ? "CORE" : left.unit_type;
+      const rightKind = right.kind === "CORE" ? "CORE" : right.unit_type;
+      const orderDiff = (UNIT_TYPE_ORDER[leftKind] || 99) - (UNIT_TYPE_ORDER[rightKind] || 99);
+      if (orderDiff !== 0) return orderDiff;
+      return String(left.id).localeCompare(String(right.id));
+    });
+
+  const filtered = units.filter((item) => shouldDrawObject(item));
+
+  if (!filtered.length) {
+    const empty = document.createElement("li");
+    empty.className = "empty-state";
+    empty.textContent = "当前没有可显示的单位";
+    empty.style.cursor = "default";
+    ui.unitList.append(empty);
+    return;
+  }
+
+  filtered.forEach((unit) => {
+    const item = document.createElement("li");
+    if (unit.kind === "CORE") item.classList.add("core");
+    item.dataset.unitId = unit.id;
+
+    const iconCell = document.createElement("div");
+    iconCell.className = "unit-icon";
+    const shape = document.createElement("span");
+    shape.className = "shape";
+    if (unit.kind === "CORE") shape.classList.add("core");
+    else if (unit.unit_type === "WORKER") shape.classList.add("worker");
+    else if (unit.unit_type === "VANGUARD") shape.classList.add("vanguard");
+    else if (unit.unit_type === "RANGER") shape.classList.add("ranger");
+    iconCell.append(shape);
+
+    const info = document.createElement("div");
+    info.className = "unit-info";
+    const idSpan = document.createElement("span");
+    idSpan.className = "unit-id";
+    idSpan.textContent = unit.id.slice(0, 8);
+    const meta = document.createElement("span");
+    meta.className = "unit-meta";
+    const cargo = unit.kind === "UNIT" && unit.unit_type === "WORKER" && unit.cargo > 0 ? ` · 载货${unit.cargo}` : "";
+    meta.textContent = `(${unit.position[0]}, ${unit.position[1]}) · HP ${unit.hp}${cargo}`;
+    info.append(idSpan, meta);
+
+    const action = document.createElement("span");
+    action.className = "unit-action";
+    action.textContent = formatUnitAction(actions[unit.id]);
+
+    item.append(iconCell, info, action);
+    ui.unitList.append(item);
+  });
+}
+
 function renderUnitPicker() {
   const selectedType = document.querySelector("#order-unit-type").value;
   if (selectedType === "CORE" && ui.orderSelectionMode.value === "DISTANT") {
@@ -1039,6 +1128,7 @@ async function loadOverview(tick = null) {
     updateMetrics();
     renderEvents();
     renderRanking();
+    renderUnitList();
   }
   draw();
 }
@@ -1085,6 +1175,7 @@ async function refreshControl() {
       (item) => ["CORE", "UNIT"].includes(item.kind) && item.controlled === true,
     );
     renderControl();
+    renderUnitList();
     const production = controlConfig.production;
     if (production && document.activeElement?.form !== ui.productionForm) {
       document.querySelector("#production-worker").value = production.worker_weight;
@@ -1217,13 +1308,7 @@ canvas.addEventListener("wheel", (event) => {
 
 // 兵种筛选按钮切换监听
 document.querySelectorAll("[data-unit-filter]").forEach((button) => {
-  button.addEventListener("click", () => {
-    state.unitFilter = button.dataset.unitFilter;
-    document.querySelectorAll("[data-unit-filter]").forEach((btn) => {
-      btn.classList.toggle("active", btn === button);
-    });
-    draw();
-  });
+  button.addEventListener("click", () => setUnitFilter(button.dataset.unitFilter));
 });
 document.querySelector("#previous-tick").addEventListener("click", () => selectIndex(state.selectedIndex - 1));
 document.querySelector("#next-tick").addEventListener("click", () => selectIndex(state.selectedIndex + 1));
@@ -1241,6 +1326,13 @@ ui.panelToggle.addEventListener("click", () => {
   const title = state.panelVisible ? "隐藏右侧情报面板" : "显示右侧情报面板";
   ui.panelToggle.title = title;
   ui.panelToggle.setAttribute("aria-label", title);
+});
+ui.unitsPanelToggle.addEventListener("click", () => {
+  state.unitsPanelVisible = !state.unitsPanelVisible;
+  ui.unitsPanel.classList.toggle("hidden", !state.unitsPanelVisible);
+  const title = state.unitsPanelVisible ? "隐藏单位列表" : "显示单位列表";
+  ui.unitsPanelToggle.title = title;
+  ui.unitsPanelToggle.setAttribute("aria-label", title);
 });
 ui.slider.addEventListener("input", () => selectIndex(Number(ui.slider.value)));
 document.querySelector("#events-tab").addEventListener("click", () => setPanel("events"));
@@ -1442,6 +1534,15 @@ ui.expeditionList.addEventListener("click", async (event) => {
 
 [ui.events, ui.kills, ui.losses, ui.orders, ui.expeditionList].forEach((list) => {
   list.addEventListener("click", handleCoordClick);
+});
+
+ui.unitList.addEventListener("click", (event) => {
+  const item = event.target.closest("li[data-unit-id]");
+  if (!item) return;
+  const unitId = item.dataset.unitId;
+  const unit = state.overview?.state?.objects?.find((obj) => obj.id === unitId && obj.position);
+  if (!unit) return;
+  locatePosition(unit.position, Math.max(state.view.scale, 10));
 });
 
 new ResizeObserver(resizeCanvas).observe(canvas);
