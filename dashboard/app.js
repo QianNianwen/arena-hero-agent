@@ -41,6 +41,7 @@ const ui = {
   mapZoomOut: document.querySelector("#map-zoom-out"),
   mapZoomHome: document.querySelector("#map-zoom-home"),
   unitsPanel: document.querySelector("#units-panel"),
+  unitsPanelContainer: document.querySelector("#units-panel-container"),
   unitsPanelToggle: document.querySelector("#units-panel-toggle"),
   unitList: document.querySelector("#unit-list"),
   allianceForm: document.querySelector("#alliance-form"),
@@ -347,7 +348,7 @@ function drawAxes() {
     return;
   }
   context.save();
-  context.strokeStyle = "rgba(240, 200, 76, 0.55)";
+  context.strokeStyle = "rgba(80, 110, 125, 0.65)";
   context.lineWidth = 1.5;
   context.beginPath();
   context.moveTo(0, originY);
@@ -1329,7 +1330,8 @@ ui.panelToggle.addEventListener("click", () => {
 });
 ui.unitsPanelToggle.addEventListener("click", () => {
   state.unitsPanelVisible = !state.unitsPanelVisible;
-  ui.unitsPanel.classList.toggle("hidden", !state.unitsPanelVisible);
+  ui.unitsPanelContainer.classList.toggle("hidden", !state.unitsPanelVisible);
+  ui.unitsPanelToggle.textContent = state.unitsPanelVisible ? "‹" : "›";
   const title = state.unitsPanelVisible ? "隐藏单位列表" : "显示单位列表";
   ui.unitsPanelToggle.title = title;
   ui.unitsPanelToggle.setAttribute("aria-label", title);

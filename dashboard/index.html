@@ -32,8 +32,8 @@
   <main class="workspace">
     <section class="map-region" aria-label="战术地图">
       <canvas id="map" tabindex="0"></canvas>
-      <button id="units-panel-toggle" class="units-panel-toggle" type="button" title="切换单位列表" aria-label="切换单位列表">⚔</button>
-      <div id="units-panel" class="units-panel">
+      <div id="units-panel-container" class="units-panel-container">
+        <div id="units-panel" class="units-panel">
         <div class="units-panel-header">
           <h3>当前单位</h3>
           <div class="unit-filter-group" role="group" aria-label="兵种筛选">
@@ -44,6 +44,8 @@
           </div>
         </div>
         <ol id="unit-list" class="unit-list"></ol>
+        </div>
+        <button id="units-panel-toggle" class="units-panel-toggle" type="button" title="隐藏单位列表" aria-label="隐藏单位列表">‹</button>
       </div>
       <button id="panel-toggle" class="panel-toggle" type="button" title="隐藏右侧情报面板" aria-label="隐藏右侧情报面板">☰</button>
       <div class="map-zoom-controls" aria-label="地图缩放">
