@@ -39,24 +39,6 @@
         <button id="map-zoom-home" class="icon-button" type="button" title="定位己方 Core" aria-label="定位己方 Core">⌖</button>
         <button id="fit-map" class="fit-map-button" type="button" title="适配全图" aria-label="适配全图">全图</button>
       </div>
-      <div class="map-toolbar">
-        <label><input type="checkbox" data-map-layer="explored" checked> 已探索</label>
-        <label><input type="checkbox" data-map-layer="obstacles" checked> 障碍</label>
-        <label><input type="checkbox" data-map-layer="resources" checked> 资源</label>
-        <label><input type="checkbox" data-map-layer="history" checked> 历史</label>
-        <label><input type="checkbox" data-map-layer="routes"> 路线</label>
-        <div class="toolbar-divider"></div>
-		<div class="unit-filter-group" role="group" aria-label="兵种筛选">
-			<button type="button" class="unit-filter-btn active" data-unit-filter="ALL">全部</button>
-			<button type="button" class="unit-filter-btn" data-unit-filter="WORKER">工兵 W</button>
-			<button type="button" class="unit-filter-btn" data-unit-filter="VANGUARD">先锋 V</button>
-			<button type="button" class="unit-filter-btn" data-unit-filter="RANGER">游侠 R</button>
-		</div>
-		<div class="toolbar-divider"></div>
-			<label class="relative-coord-label">
-				<input type="checkbox" id="toggle-relative-coord"> 相对 Core 坐标
-			</label>
-      </div>
       <div class="legend" aria-label="地图图例">
         <span><i class="swatch explored"></i>已探索</span>
         <span><i class="swatch obstacle"></i>障碍</span>
@@ -86,6 +68,28 @@
 		<div class="control-toolbar">
 			<button id="toggle-all-control" type="button" class="secondary-button">全部折叠</button>
 		</div>
+        <div class="control-section">
+          <h3>地图显示</h3>
+          <div class="map-display-controls">
+            <div class="layer-toggles">
+              <label><input type="checkbox" data-map-layer="explored" checked> 已探索</label>
+              <label><input type="checkbox" data-map-layer="obstacles" checked> 障碍</label>
+              <label><input type="checkbox" data-map-layer="resources" checked> 资源</label>
+              <label><input type="checkbox" data-map-layer="history" checked> 历史</label>
+              <label><input type="checkbox" data-map-layer="routes"> 路线</label>
+            </div>
+            <div class="unit-filter-group" role="group" aria-label="兵种筛选">
+              <button type="button" class="unit-filter-btn active" data-unit-filter="ALL">全部</button>
+              <button type="button" class="unit-filter-btn" data-unit-filter="WORKER">工兵 W</button>
+              <button type="button" class="unit-filter-btn" data-unit-filter="VANGUARD">先锋 V</button>
+              <button type="button" class="unit-filter-btn" data-unit-filter="RANGER">游侠 R</button>
+            </div>
+            <div class="display-options">
+              <label class="relative-coord-label"><input type="checkbox" id="toggle-relative-coord"> 相对 Core 坐标</label>
+              <label class="legend-toggle-label"><input type="checkbox" id="toggle-legend" checked> 显示图例</label>
+            </div>
+          </div>
+        </div>
         <form id="production-form" class="config-form">
           <h3>生产比例</h3>
           <label>Worker <input id="production-worker" type="number" min="0" max="100" value="4" required></label>

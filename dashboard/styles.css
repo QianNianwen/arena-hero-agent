@@ -110,11 +110,51 @@ button:focus-visible, input:focus-visible, canvas:focus-visible { outline: 2px s
 .order-form .target-picker-button.active { color: #071014; background: var(--gold); border-color: var(--gold); }
 #map.picking-target { cursor: crosshair; }
 .form-status { grid-column: 1 / -1; min-height: 16px; margin: 0; color: #9eabb4; font-size: 11px; }
-.map-toolbar { position: absolute; z-index: 2; top: 10px; left: 10px; display: flex; flex-wrap: wrap; gap: 5px 9px; align-items: center; max-width: calc(100% - 20px); padding: 6px; background: rgba(10, 14, 17, 0.9); border: 1px solid var(--border); }
-.map-toolbar button { height: 28px; padding: 0 9px; }
-.map-toolbar label { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #aab5bc; }
-.map-toolbar input { accent-color: var(--green); }
 .cursor-position { position: absolute; right: 14px; top: 52px; padding: 5px 7px; color: #aeb9c0; background: rgba(10, 14, 17, 0.88); border: 1px solid var(--border); font-size: 11px; pointer-events: none; }
+
+.map-display-controls {
+  padding: 0 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.layer-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.layer-toggles label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: #aab5bc;
+  cursor: pointer;
+}
+
+.layer-toggles input { accent-color: var(--green); }
+
+.display-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+
+.legend-toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: #aab5bc;
+  cursor: pointer;
+  user-select: none;
+}
+
+.legend-toggle-label input { accent-color: var(--green); }
+
+body.legend-hidden .legend { display: none; }
 
 .panel-toggle {
   position: absolute;
@@ -322,13 +362,6 @@ body.panel-hidden .intel-panel { display: none; }
 .section-collapsed + #expedition-list {
   display: none !important;
 }
-/* 地图工具栏分割线与兵种筛选按钮组 */
-.toolbar-divider {
-  width: 1px;
-  height: 18px;
-  background: var(--border);
-  margin: 0 3px;
-}
 
 .unit-filter-group {
   display: inline-flex;
@@ -390,9 +423,8 @@ body.panel-hidden .intel-panel { display: none; }
   .controls #tick-slider, .controls #previous-tick, .controls #next-tick, .controls #zoom-out, .controls #zoom-in { display: none; }
   .workspace { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) 280px; }
   body.panel-hidden .workspace { grid-template-rows: 1fr; }
-  .intel-panel { border-left: 0; border-top: 1px solid var(--border); }
+    .intel-panel { border-left: 0; border-top: 1px solid var(--border); }
   .legend { grid-template-columns: repeat(2, auto); left: 8px; bottom: 8px; }
-  .map-toolbar label { display: none; }
   .map-status { right: 8px; bottom: 8px; max-width: 48%; }
   .map-zoom-controls { right: 8px; bottom: 46px; }
   .panel-toggle { top: 8px; right: 8px; }

@@ -90,6 +90,7 @@ const state = {
   unitFilter: "ALL",
   useRelativeCoords: false,
   panelVisible: true,
+  legendVisible: true,
   flashTarget: null,
 };
 // 获取己方 Core 的绝对坐标
@@ -1485,4 +1486,10 @@ document.querySelector("#control-panel")?.addEventListener("click", (event) => {
 document.querySelector("#toggle-relative-coord")?.addEventListener("change", (event) => {
   state.useRelativeCoords = event.target.checked;
   draw();
+});
+
+// 图例显示开关监听
+document.querySelector("#toggle-legend")?.addEventListener("change", (event) => {
+  state.legendVisible = event.target.checked;
+  document.body.classList.toggle("legend-hidden", !state.legendVisible);
 });
