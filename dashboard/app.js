@@ -333,6 +333,26 @@ function drawGrid() {
   context.stroke();
 }
 
+function drawAxes() {
+  const [originX, originY] = screenPosition([0, 0]);
+  if (
+    originX < -state.viewport.width || originX > state.viewport.width * 2 ||
+    originY < -state.viewport.height || originY > state.viewport.height * 2
+  ) {
+    return;
+  }
+  context.save();
+  context.strokeStyle = "rgba(240, 200, 76, 0.55)";
+  context.lineWidth = 1.5;
+  context.beginPath();
+  context.moveTo(0, originY);
+  context.lineTo(state.viewport.width, originY);
+  context.moveTo(originX, 0);
+  context.lineTo(originX, state.viewport.height);
+  context.stroke();
+  context.restore();
+}
+
 function drawTrail(points) {
   if (!Array.isArray(points) || points.length < 2) return;
   context.strokeStyle = "rgba(61,184,227,0.24)";
@@ -623,6 +643,7 @@ function draw() {
   context.fillStyle = colors.background;
   context.fillRect(0, 0, rect.width, rect.height);
   drawGrid();
+  drawAxes();
   const overview = state.overview;
   if (!overview?.available) {
     context.fillStyle = "#76838b";
@@ -1230,7 +1251,6 @@ document.querySelectorAll(".ranking-mode").forEach((button) => button.addEventLi
   renderRanking();
 }));
 document.querySelector("#fit-map").addEventListener("click", fitMap);
-document.querySelector("#home-map").addEventListener("click", () => centerMap(true));
 document.querySelectorAll("[data-map-layer]").forEach((input) => input.addEventListener("change", () => {
   state.layers[input.dataset.mapLayer] = input.checked;
   draw();
