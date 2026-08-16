@@ -1585,6 +1585,15 @@ document.querySelector("#control-panel")?.addEventListener("click", (event) => {
   }
 });
 
+function setLegendVisible(visible) {
+  state.legendVisible = visible;
+  document.body.classList.toggle("legend-hidden", !visible);
+  const checkbox = document.querySelector("#toggle-legend");
+  if (checkbox) checkbox.checked = visible;
+  const btn = document.querySelector("#legend-toggle");
+  if (btn) btn.classList.toggle("inactive", !visible);
+}
+
 // 相对坐标模式开关监听
 document.querySelector("#toggle-relative-coord")?.addEventListener("change", (event) => {
   state.useRelativeCoords = event.target.checked;
@@ -1593,6 +1602,9 @@ document.querySelector("#toggle-relative-coord")?.addEventListener("change", (ev
 
 // 图例显示开关监听
 document.querySelector("#toggle-legend")?.addEventListener("change", (event) => {
-  state.legendVisible = event.target.checked;
-  document.body.classList.toggle("legend-hidden", !state.legendVisible);
+  setLegendVisible(event.target.checked);
+});
+
+document.querySelector("#legend-toggle")?.addEventListener("click", () => {
+  setLegendVisible(!state.legendVisible);
 });

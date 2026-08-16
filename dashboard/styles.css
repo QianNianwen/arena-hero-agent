@@ -334,6 +334,24 @@ body.legend-hidden .legend { display: none; }
   border-radius: 3px;
 }
 
+.map-zoom-controls .legend-toggle-button {
+  width: 34px;
+  height: 42px;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1.1;
+  color: #dce7ec;
+  background: rgba(10, 14, 17, 0.9);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.map-zoom-controls .legend-toggle-button.inactive {
+  color: #77858e;
+  text-decoration: line-through;
+}
+
 body.panel-hidden .workspace { grid-template-columns: 1fr; }
 body.panel-hidden .intel-panel { display: none; }
 
