@@ -1658,6 +1658,20 @@ setInterval(refreshTicks, 5000);
 setInterval(refreshLeaderboard, 15000);
 setInterval(refreshControl, 5000);
 
+// 移动端初始化：默认收起两侧面板，给地图留出更多空间
+if (window.innerWidth <= 760) {
+  state.panelVisible = false;
+  document.body.classList.add("panel-hidden");
+  ui.panelToggle.title = "显示右侧情报面板";
+  ui.panelToggle.setAttribute("aria-label", "显示右侧情报面板");
+
+  state.unitsPanelVisible = false;
+  ui.unitsPanelContainer.classList.add("hidden");
+  ui.unitsPanelToggle.textContent = "›";
+  ui.unitsPanelToggle.title = "显示单位列表";
+  ui.unitsPanelToggle.setAttribute("aria-label", "显示单位列表");
+}
+
 let isAllCollapsed = false;
 
 // 折叠 / 展开指定栏目
