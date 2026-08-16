@@ -97,6 +97,7 @@ const state = {
   unitsPanelVisible: true,
   legendVisible: true,
   flashTarget: null,
+  pinch: null,
 };
 // 获取己方 Core 的绝对坐标
 function getCorePosition() {
@@ -243,8 +244,15 @@ function drawSelectedUnitsHighlight() {
   }
   context.restore();
 }
+function getPixelRatio() {
+  const dpr = window.devicePixelRatio || 1;
+  // 移动端高 DPI 设备限制为 2，降低 GPU/内存开销
+  if (window.innerWidth <= 760) return Math.min(dpr, 2);
+  return Math.max(1, dpr);
+}
+
 function resizeCanvas() {
-  const ratio = Math.max(1, window.devicePixelRatio || 1);
+  const ratio = getPixelRatio();
   const rect = canvas.getBoundingClientRect();
   state.viewport = { width: rect.width, height: rect.height };
   canvas.width = Math.max(1, Math.round(rect.width * ratio));
@@ -1300,12 +1308,51 @@ canvas.addEventListener("pointerup", (event) => {
   }
 });
 canvas.addEventListener("wheel", (event) => {
-  clearHover(); 
+  clearHover();
   event.preventDefault();
   state.view.scale = Math.max(1.5, Math.min(32, state.view.scale * (event.deltaY < 0 ? 1.14 : 0.88)));
   updateMetrics();
   scheduleDraw();
 }, { passive: false });
+
+// 移动端双指缩放
+canvas.addEventListener("touchstart", (event) => {
+  if (event.touches.length === 2) {
+    event.preventDefault();
+    const dx = event.touches[0].clientX - event.touches[1].clientX;
+    const dy = event.touches[0].clientY - event.touches[1].clientY;
+    state.pinch = {
+      startDistance: Math.hypot(dx, dy),
+      startScale: state.view.scale,
+      center: [
+        (event.touches[0].clientX + event.touches[1].clientX) / 2,
+        (event.touches[0].clientY + event.touches[1].clientY) / 2,
+      ],
+    };
+  }
+}, { passive: false });
+
+canvas.addEventListener("touchmove", (event) => {
+  if (event.touches.length === 2 && state.pinch) {
+    event.preventDefault();
+    const dx = event.touches[0].clientX - event.touches[1].clientX;
+    const dy = event.touches[0].clientY - event.touches[1].clientY;
+    const distance = Math.hypot(dx, dy);
+    const ratio = distance / state.pinch.startDistance;
+    const newScale = Math.max(1.5, Math.min(32, state.pinch.startScale * ratio));
+    state.view.scale = newScale;
+    updateMetrics();
+    scheduleDraw();
+  }
+}, { passive: false });
+
+canvas.addEventListener("touchend", () => {
+  state.pinch = null;
+});
+
+canvas.addEventListener("touchcancel", () => {
+  state.pinch = null;
+});
 
 // 兵种筛选按钮切换监听
 document.querySelectorAll("[data-unit-filter]").forEach((button) => {
