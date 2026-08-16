@@ -5,12 +5,12 @@ const context = canvas.getContext("2d", { alpha: false });
 const MAP_CHUNK_SIZE = 32;
 const MAP_LAYERS = ["explored", "obstacles", "resource_history"];
 const ui = {
-  tick: document.querySelector("#metric-tick"),
-  resources: document.querySelector("#metric-resources"),
-  population: document.querySelector("#metric-population"),
-  force: document.querySelector("#metric-force"),
-  posture: document.querySelector("#metric-posture"),
-  enemies: document.querySelector("#metric-enemies"),
+  tick: document.querySelector("#status-tick"),
+  resources: document.querySelector("#status-resources"),
+  population: document.querySelector("#status-population"),
+  force: document.querySelector("#status-force"),
+  posture: document.querySelector("#status-posture"),
+  enemies: document.querySelector("#status-enemies"),
   status: document.querySelector("#map-status"),
   slider: document.querySelector("#tick-slider"),
   play: document.querySelector("#toggle-play"),
@@ -1222,7 +1222,7 @@ function togglePlay() {
 }
 
 function setPanel(name) {
-  ["events", "ranking", "control"].forEach((item) => {
+  ["status", "ranking", "control"].forEach((item) => {
     const active = item === name;
     document.querySelector(`#${item}-tab`).classList.toggle("active", active);
     document.querySelector(`#${item}-tab`).setAttribute("aria-selected", active);
@@ -1337,7 +1337,7 @@ ui.unitsPanelToggle.addEventListener("click", () => {
   ui.unitsPanelToggle.setAttribute("aria-label", title);
 });
 ui.slider.addEventListener("input", () => selectIndex(Number(ui.slider.value)));
-document.querySelector("#events-tab").addEventListener("click", () => setPanel("events"));
+document.querySelector("#status-tab").addEventListener("click", () => setPanel("status"));
 document.querySelector("#ranking-tab").addEventListener("click", () => setPanel("ranking"));
 document.querySelector("#control-tab").addEventListener("click", () => setPanel("control"));
 document.querySelectorAll(".ranking-mode").forEach((button) => button.addEventListener("click", () => {

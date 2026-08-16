@@ -9,14 +9,6 @@
 <body>
   <header class="topbar">
     <div class="brand">Arena Hero 战术地图</div>
-    <div class="metrics" aria-live="polite">
-      <span>Tick <strong id="metric-tick">--</strong></span>
-      <span>资源 <strong id="metric-resources">--/--</strong></span>
-      <span>人口 <strong id="metric-population">--</strong></span>
-      <span>兵力 <strong id="metric-force">--</strong></span>
-      <span>态势 <strong id="metric-posture">--</strong></span>
-      <span>敌情 <strong id="metric-enemies">--</strong></span>
-    </div>
     <nav class="controls" aria-label="历史回放控制">
       <button id="previous-tick" class="icon-button" title="上一个 Tick" aria-label="上一个 Tick">‹</button>
       <button id="toggle-play" class="icon-button" title="播放历史" aria-label="播放历史">▶</button>
@@ -73,11 +65,20 @@
 
     <aside class="intel-panel">
       <div class="panel-tabs" role="tablist" aria-label="情报视图">
-        <button id="events-tab" class="panel-tab active" role="tab" aria-selected="true">事件</button>
+        <button id="status-tab" class="panel-tab active" role="tab" aria-selected="true">状态</button>
         <button id="control-tab" class="panel-tab" role="tab" aria-selected="false">调兵</button>
         <button id="ranking-tab" class="panel-tab" role="tab" aria-selected="false">排行榜</button>
       </div>
-      <section id="events-panel" class="panel-view" role="tabpanel">
+      <section id="status-panel" class="panel-view" role="tabpanel">
+        <div class="status-metrics">
+          <div class="metric"><span>Tick</span><strong id="status-tick">--</strong></div>
+          <div class="metric"><span>资源</span><strong id="status-resources">--/--</strong></div>
+          <div class="metric"><span>人口</span><strong id="status-population">--</strong></div>
+          <div class="metric"><span>兵力</span><strong id="status-force">--</strong></div>
+          <div class="metric"><span>态势</span><strong id="status-posture">--</strong></div>
+          <div class="metric"><span>敌情</span><strong id="status-enemies">--</strong></div>
+        </div>
+        <h4 class="status-events-heading">事件</h4>
         <ol id="event-list" class="event-list"></ol>
       </section>
       <section id="control-panel" class="panel-view hidden" role="tabpanel">
