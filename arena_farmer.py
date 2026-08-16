@@ -44,6 +44,7 @@ from arena_hero import (
     TransportError,
     Turn,
     UnitType,
+    core_resource_capacity,
     unit_cost,
 )
 
@@ -75,6 +76,13 @@ DEFENSE_VANGUARD_TARGET = FORCE_STAGES[-1][1]
 DEFENSE_RANGER_TARGET = FORCE_STAGES[-1][2]
 TARGET_POPULATION = sum(FORCE_STAGES[-1])
 MAX_WORKER_TARGET = FORCE_STAGES[-1][0]
+WORKER_CONVERSION_TARGET = FORCE_STAGES[1][0]
+WORKER_CONVERSION_MIN_VANGUARDS = FORCE_STAGES[2][1]
+WORKER_CONVERSION_MIN_RANGERS = FORCE_STAGES[2][2]
+WORKER_CONVERSION_BATCH_LIMIT = 2
+WORKER_CONVERSION_PRODUCTIVE_MODES = frozenset(
+    {"HARVEST", "DEPOSIT", "RETURN", "EVADE_CARGO"}
+)
 VANGUARD_GUARD_RADIUS = 3
 RANGER_GUARD_RADIUS = 2
 VANGUARD_CORE_GUARDS = 1
@@ -135,7 +143,6 @@ SCOUT_STALL_TICKS = 3
 RECOVERY_TICKS = 160
 RECOVERY_MIN_WORKERS = 8
 RECOVERY_MIN_RESOURCES = 20
-EMERGENCY_SWAP_MIN_WORKERS = 8
 RECOVERY_THREAT_DISTANCE = 12
 RECOVERY_INFERENCE_RESOURCE_LIMIT = CORE_RESOURCE_RESERVE + unit_cost(
     UnitType.WORKER,
@@ -158,13 +165,9 @@ CORE_MOVE_COMMIT_PROGRESS = 2
 UNIT_EVADE_TRIGGER_DISTANCE = 5
 ASSAULT_REINFORCEMENT_RADIUS = UNIT_EVADE_TRIGGER_DISTANCE
 FULL_ASSAULT_HOSTILE_COUNT = 4
+BEACON_CAMPAIGN_POPULATION = 40
 BEACON_CAMPAIGN_RESOURCES = 30
-# The Beacon coordinate is public every Tick, so a carrier parked next to the
-# Core would broadcast it. Hold the Beacon at a still, low-exposure outpost this
-# far away instead, and only start a run the fleet can actually walk.
-BEACON_CAMPAIGN_MAX_DISTANCE = 80
-BEACON_OUTPOST_MIN_CORE_DISTANCE = 15
-BEACON_OUTPOST_SEARCH_RADIUS = 4
+BEACON_RETURN_RADIUS = 3
 RETREAT_MIN_BEACON_DISTANCE = 224
 COMBAT_PATROL_INITIAL_RADIUS = 24
 COMBAT_PATROL_GROWTH_TICKS = 64
@@ -182,6 +185,7 @@ AGENT_EXIT_CODE = 14
 DEFAULT_STALE_TURN_TIMEOUT_SECONDS = 0.0
 DEFAULT_ALLIANCE_STALE_SECONDS = 60.0
 DEFAULT_ALLIANCE_BARRIER_TIMEOUT_SECONDS = 1.0
+ALLIANCE_ROSTER_USER_AGENT = "arena-hero-agent/1.0"
 ALLY_CORE_RALLY_RADIUS = 12
 TURN_SKIP_API_ERRORS = frozenset(
     {
@@ -221,8 +225,7 @@ SCOUT_STAGE_CYCLE = len(SCOUT_VECTORS)
 SCOUT_RING_STEP = 10
 SCOUT_RING_COUNT = 4
 SCOUT_COVERAGE_MEMORY_TTL = 4096
-SURVEY_MAX_CHUNKS = 1024
-CHUNK_SIZE = 32
+ALLIANCE_SCOUT_CHUNK_LIMIT = 4096
 
 Position = tuple[int, int]
 
@@ -255,22 +258,6 @@ class GlobalPosture(str, Enum):
 
 def _chunk_coordinates(position: Position) -> Position:
     return position[0] // 32, position[1] // 32
-
-
-def _parse_survey_region(value: str) -> tuple[Position, Position]:
-    """Parse `x1,y1,x2,y2` into normalised inclusive corners."""
-    parts = [part.strip() for part in value.split(",")]
-    if len(parts) != 4:
-        raise ValueError("survey region must be 'x1,y1,x2,y2'")
-    try:
-        x1, y1, x2, y2 = (int(part) for part in parts)
-    except ValueError as error:
-        raise ValueError("survey region coordinates must be integers") from error
-    corners = ((min(x1, x2), min(y1, y2)), (max(x1, x2), max(y1, y2)))
-    for corner in corners:
-        if not _is_signed_int64_position(corner):
-            raise ValueError("survey region exceeds the signed 64-bit grid")
-    return corners
 
 
 def _chunk_axis(value: int) -> int:
@@ -325,6 +312,7 @@ class EnemyCoreSighting:
     first_tick: int
     last_tick: int
     observations: int = 1
+    unit_type: UnitType | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -368,6 +356,7 @@ class AlliancePeer:
     core_position: Position | None
     unit_ids: frozenset[UUID]
     unit_positions: frozenset[Position]
+    scout_chunks: tuple[tuple[Position, int], ...]
     updated_at: float
 
 
@@ -481,7 +470,11 @@ class AllianceRosterClient:
         self._last_attempt_at = selected_now
         request = urllib.request.Request(
             self.url,
-            headers={"Authorization": f"Bearer {self._token}"},
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/json",
+                "User-Agent": ALLIANCE_ROSTER_USER_AGENT,
+            },
         )
         try:
             response = self._opener(request, timeout=self.timeout_seconds)
@@ -540,8 +533,21 @@ class AllianceCoordinator:
     def state_path(self) -> Path:
         return self.directory / f"{self.account_id}.json"
 
-    def publish(self, turn: Turn) -> None:
+    def publish(
+        self,
+        turn: Turn,
+        *,
+        scout_chunks: Mapping[Position, int] | None = None,
+    ) -> None:
         core = turn.core
+        recent_scout_chunks = sorted(
+            (
+                (chunk, last_seen)
+                for chunk, last_seen in (scout_chunks or {}).items()
+                if turn.tick - SCOUT_COVERAGE_MEMORY_TTL <= last_seen <= turn.tick
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )[:ALLIANCE_SCOUT_CHUNK_LIMIT]
         state = {
             "version": 1,
             "alliance_id": self.alliance_id,
@@ -562,6 +568,10 @@ class AllianceCoordinator:
                     "cargo": getattr(unit, "cargo", 0),
                 }
                 for unit in turn.units
+            ],
+            "scout_chunks": [
+                [chunk[0], chunk[1], last_seen]
+                for chunk, last_seen in recent_scout_chunks
             ],
             "updated_at": time.time(),
         }
@@ -608,6 +618,26 @@ class AllianceCoordinator:
                     else None
                 )
                 core_id_raw = raw.get("core_id")
+                raw_scout_chunks = raw.get("scout_chunks", [])
+                if (
+                    not isinstance(raw_scout_chunks, list)
+                    or len(raw_scout_chunks) > ALLIANCE_SCOUT_CHUNK_LIMIT
+                ):
+                    continue
+                scout_chunks: list[tuple[Position, int]] = []
+                for value in raw_scout_chunks:
+                    if (
+                        not isinstance(value, list)
+                        or len(value) != 3
+                        or any(
+                            isinstance(item, bool) or not isinstance(item, int)
+                            for item in value
+                        )
+                        or not _is_signed_int64_position((value[0], value[1]))
+                        or value[2] < 0
+                    ):
+                        raise ValueError("alliance scout chunk is invalid")
+                    scout_chunks.append(((value[0], value[1]), value[2]))
                 peers.append(
                     AlliancePeer(
                         account_id=account_id,
@@ -623,6 +653,7 @@ class AllianceCoordinator:
                             for value in raw.get("unit_positions", ())
                             if isinstance(value, list) and len(value) == 2
                         ),
+                        scout_chunks=tuple(scout_chunks),
                         updated_at=updated_at,
                     )
                 )
@@ -921,6 +952,24 @@ def _minimum_enemy_distance(
         (_distance(position, enemy.position) for enemy in enemies),
         default=SIGNED_INT64_MAX,
     )
+
+
+def _locally_outnumbered(
+    unit: object,
+    friendlies: Sequence[object],
+    enemies: Sequence[object],
+) -> bool:
+    local_enemies = sum(
+        getattr(enemy, "unit_type", None) in {UnitType.VANGUARD, UnitType.RANGER}
+        and _distance(unit.position, enemy.position) <= UNIT_EVADE_TRIGGER_DISTANCE
+        for enemy in enemies
+    )
+    local_support = sum(
+        friendly.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+        and _distance(unit.position, friendly.position) <= UNIT_EVADE_TRIGGER_DISTANCE
+        for friendly in friendlies
+    )
+    return local_enemies > local_support
 
 
 def _enemy_distance_vector(
@@ -1433,6 +1482,7 @@ def _queue_core_delivery_handoff(
     enemies: Sequence[object],
     *,
     force_departure: bool = False,
+    excluded_ids: set[UUID] | None = None,
 ) -> set[UUID]:
     """Break a full Core cell by shifting a friendly corridor from outside in."""
     core = turn.core
@@ -1442,6 +1492,7 @@ def _queue_core_delivery_handoff(
         (
             worker
             for worker in turn.workers
+            if excluded_ids is None or worker.id not in excluded_ids
             if worker.position == core.position
             and (
                 force_departure
@@ -1497,6 +1548,8 @@ def _queue_core_delivery_handoff(
 
     units_by_position: dict[Position, list[object]] = {}
     for unit in turn.units:
+        if excluded_ids is not None and unit.id in excluded_ids:
+            continue
         if _legal_attack_targets(unit, enemies, context.obstacles):
             continue
         units_by_position.setdefault(unit.position, []).append(unit)
@@ -1581,6 +1634,7 @@ def _queue_core_delivery_handoff(
             if not force_departure
             if turn.resource_space > 0
             and worker.cargo > 0
+            and (excluded_ids is None or worker.id not in excluded_ids)
             and worker.id not in handoff
             and _distance(worker.position, core.position) == 1
         ),
@@ -2066,7 +2120,6 @@ class CoreFarmer:
         compatibility_marker: Path | None = DEFAULT_COMPATIBILITY_MARKER,
         alliance_coordinator: AllianceCoordinator | None = None,
         alliance_roster_client: AllianceRosterClient | None = None,
-        survey_region: tuple[Position, Position] | None = None,
     ) -> None:
         if not 1 <= worker_target <= MAX_WORKER_TARGET:
             raise ValueError(
@@ -2086,6 +2139,7 @@ class CoreFarmer:
         self.allied_usernames: set[str] = set()
         self.allied_occupied_cells: set[Position] = set()
         self.alliance_leader: AlliancePeer | None = None
+        self.alliance_rally_enabled = False
         self.alliance_rally_radius = ALLY_CORE_RALLY_RADIUS
         self.alliance_turn_tick: int | None = None
         self.compatibility_hold = False
@@ -2145,24 +2199,32 @@ class CoreFarmer:
         self.unit_hunt_vanguard_ids: set[UUID] = set()
         self.unit_hunt_ranger_ids: set[UUID] = set()
         self.beacon_runner_id: UUID | None = None
-        self.beacon_outpost_position: Position | None = None
-        self.survey_region = survey_region
-        self._survey_centers: tuple[Position, ...] | None = None
         self.threat_caution_until_tick = 0
         self.startup_tick: int | None = None
         self.manual_order_ids: tuple[int, ...] = ()
+        self.manual_claimed_unit_ids: set[UUID] = set()
         self.production_weights: dict[UnitType, int] | None = None
+        self.worker_conversion_active = False
+        self.worker_conversion_ids: set[UUID] = set()
+        self.worker_conversion_unit_type: UnitType | None = None
+        self.effective_worker_target = worker_target
         self.expedition_members: dict[int, set[UUID]] = {}
         self.revenge_usernames: set[str] = set()
         self.manual_core_order_active = False
-        self.emergency_swap_worker_id: UUID | None = None
 
     def _refresh_alliance(self, turn: Turn) -> None:
         coordinator = self.alliance_coordinator
         peers: tuple[AlliancePeer, ...] = ()
         if coordinator is not None:
             try:
-                coordinator.publish(turn)
+                coordinator.publish(
+                    turn,
+                    scout_chunks=(
+                        self.scout_chunk_last_seen
+                        if coordinator.expected_members > 1
+                        else None
+                    ),
+                )
                 deadline = time.monotonic() + coordinator.barrier_timeout_seconds
                 while True:
                     peers = coordinator.peers()
@@ -2198,6 +2260,16 @@ class CoreFarmer:
         )
         self.alliance_peers = peers
         self.alliance_turn_tick = turn.tick
+        if coordinator is not None and coordinator.expected_members > 1:
+            for peer in peers:
+                if peer.account_id == coordinator.account_id:
+                    continue
+                for chunk, last_seen in peer.scout_chunks:
+                    shared_tick = min(last_seen, peer.tick, turn.tick)
+                    self.scout_chunk_last_seen[chunk] = max(
+                        shared_tick,
+                        self.scout_chunk_last_seen.get(chunk, -1),
+                    )
         local_object_ids = {
             identifier
             for peer in peers
@@ -2346,6 +2418,7 @@ class CoreFarmer:
             coordinator is None
             or leader is None
             or core is None
+            or not self.alliance_rally_enabled
             or leader.account_id == coordinator.account_id
             or leader.core_position is None
             or _distance(core.position, leader.core_position) <= self.alliance_rally_radius
@@ -2616,6 +2689,19 @@ class CoreFarmer:
             for threat in self.recent_attack_threats.values()
             if threat.id not in visible_ids and threat.expires_tick >= turn.tick
         }
+        for unit_id, sighting in self.enemy_unit_sightings.items():
+            if (
+                unit_id not in visible_ids
+                and unit_id not in remembered
+                and sighting.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                and turn.tick - sighting.last_tick <= CORE_VISIBILITY_GAP_TICKS
+            ):
+                remembered[unit_id] = RememberedThreat(
+                    id=unit_id,
+                    position=sighting.position,
+                    unit_type=sighting.unit_type,
+                    expires_tick=sighting.last_tick + CORE_VISIBILITY_GAP_TICKS,
+                )
         tracked_ids = (
             self.active_enemy_ids
             | self.preemptive_evade_enemy_ids
@@ -2823,6 +2909,9 @@ class CoreFarmer:
             for enemy in self._hostile_enemies(turn)
             if getattr(enemy, "kind") != "CORE"
         }
+        current_visible_cells = visible_cells(
+            turn.state.model_dump(mode="json", exclude_none=True)
+        )
         prior_motion = dict(self.enemy_unit_motion)
         if (
             self.core_observer_target_id is not None
@@ -2847,7 +2936,8 @@ class CoreFarmer:
         hidden_unit_ids = set(self.enemy_unit_sightings) - set(visible_units)
         for unit_id in hidden_unit_ids:
             if (
-                turn.tick - self.enemy_unit_sightings[unit_id].last_tick
+                self.enemy_unit_sightings[unit_id].position in current_visible_cells
+                or turn.tick - self.enemy_unit_sightings[unit_id].last_tick
                 > CORE_VISIBILITY_GAP_TICKS
             ):
                 self.enemy_unit_sightings.pop(unit_id, None)
@@ -2895,6 +2985,7 @@ class CoreFarmer:
                     position=enemy_unit.position,
                     first_tick=turn.tick,
                     last_tick=turn.tick,
+                    unit_type=enemy_unit.unit_type,
                 )
             core_distance = (
                 _distance(turn.core.position, enemy_unit.position)
@@ -3461,6 +3552,10 @@ class CoreFarmer:
             tick + RECOVERY_TICKS,
         )
         self.recovery_reason = reason
+        self.worker_conversion_active = False
+        self.effective_worker_target = self.worker_target
+        self.worker_conversion_ids.clear()
+        self.worker_conversion_unit_type = None
         # Coordinates remembered before destruction are not useful at the new spawn.
         self.resource_last_seen.clear()
         self.resource_intents.clear()
@@ -3702,74 +3797,6 @@ class CoreFarmer:
             self.scout_stages[worker_id] = 0
             used_slots.add(slot)
 
-    def _survey_centers_for_region(self) -> tuple[Position, ...]:
-        """Chunk centres covering the configured survey region.
-
-        Scout coverage is already tracked per chunk, so a region sweep is just
-        that memory restricted to the chunks the region touches. The list is
-        static for a given region, so it is computed once.
-        """
-        if self._survey_centers is not None:
-            return self._survey_centers
-        region = self.survey_region
-        if region is None:
-            self._survey_centers = ()
-            return self._survey_centers
-        (min_x, min_y), (max_x, max_y) = region
-        chunk_min = _chunk_coordinates((min_x, min_y))
-        chunk_max = _chunk_coordinates((max_x, max_y))
-        centers: list[Position] = []
-        truncated = False
-        for chunk_x in range(chunk_min[0], chunk_max[0] + 1):
-            for chunk_y in range(chunk_min[1], chunk_max[1] + 1):
-                if len(centers) >= SURVEY_MAX_CHUNKS:
-                    truncated = True
-                    break
-                center = (
-                    chunk_x * CHUNK_SIZE + CHUNK_SIZE // 2,
-                    chunk_y * CHUNK_SIZE + CHUNK_SIZE // 2,
-                )
-                if _is_signed_int64_position(center):
-                    centers.append(center)
-            if truncated:
-                break
-        if truncated:
-            print(
-                "SURVEY_REGION truncated "
-                f"chunks={len(centers)} limit={SURVEY_MAX_CHUNKS}",
-                flush=True,
-            )
-        self._survey_centers = tuple(centers)
-        return self._survey_centers
-
-    def _survey_target(
-        self,
-        core_position: Position,
-        *,
-        claim: bool = False,
-    ) -> Position | None:
-        """Least recently covered chunk centre inside the survey region."""
-        centers = self._survey_centers_for_region()
-        if not centers:
-            return None
-        unclaimed = tuple(
-            center for center in centers if center not in self.scout_claims
-        )
-        pool = unclaimed or centers
-        target = min(
-            pool,
-            key=lambda center: (
-                self.scout_chunk_last_seen.get(_chunk_coordinates(center), -1),
-                self.scout_target_last_visited.get(center, -1),
-                _distance(core_position, center),
-                center[0],
-                center[1],
-            ),
-        )
-        if claim:
-            self.scout_claims.add(target)
-        return target
-
     def _scout_target(
         self,
         worker_id: UUID,
@@ -3778,18 +3805,10 @@ class CoreFarmer:
         *,
         claim: bool = False,
     ) -> Position:
-        survey = self._survey_target(core_position, claim=claim)
-        if survey is not None:
-            return survey
         slot = self.scout_slots[worker_id]
         stage = self.scout_stages[worker_id]
         heading = (0, 0)
-        if (
-            beacon_position is not None
-            and self.beacon_policy == "pursue"
-            and _distance(core_position, beacon_position)
-            <= BEACON_CAMPAIGN_MAX_DISTANCE
-        ):
+        if beacon_position is not None and self.beacon_policy == "pursue":
             heading = (
                 (beacon_position[0] > core_position[0])
                 - (beacon_position[0] < core_position[0]),
@@ -4110,7 +4129,8 @@ class CoreFarmer:
 
     def choose_actions(self, turn: Turn) -> None:
         turn.clear()
-        self.emergency_swap_worker_id = None
+        self.worker_conversion_ids.clear()
+        self.worker_conversion_unit_type = None
         self._refresh_alliance(turn)
         if not self.alliance_ready:
             if turn.core is not None:
@@ -4129,6 +4149,7 @@ class CoreFarmer:
             self.startup_tick = turn.tick
         self._refresh_return_states(turn)
         self._update_recovery_mode(turn)
+        self._refresh_worker_conversion_phase(turn)
         self._update_core_movement_history(turn)
         self._update_enemy_awareness(turn)
         self._refresh_compatibility_hold()
@@ -4241,13 +4262,33 @@ class CoreFarmer:
             )
             self._recall_core_defenders(turn, threat_count)
 
-        workers = sorted(turn.workers, key=_uuid_sort_key)
+        all_workers = sorted(turn.workers, key=_uuid_sort_key)
+        previous_worker_modes = dict(self.worker_modes)
         current_visible_cells = visible_cells(
             turn.state.model_dump(mode="json", exclude_none=True)
         )
         self.worker_modes.clear()
         self.worker_targets.clear()
         self.scout_claims.clear()
+        self._refresh_resource_memory(turn)
+        self._refresh_healing_defenders(turn, combat_target)
+        self._plan_worker_conversion(
+            turn,
+            nearest_visible_threat,
+            previous_worker_modes,
+            combat_target,
+        )
+        for worker in all_workers:
+            if worker.id not in self.worker_conversion_ids:
+                continue
+            worker.self_destruct()
+            context.friendly_counts[worker.position] -= 1
+            self._set_worker_mode(worker, "CONVERT", core.position)
+        workers = [
+            worker
+            for worker in all_workers
+            if worker.id not in self.worker_conversion_ids
+        ]
         for worker in workers:
             self.scout_chunk_last_seen[_chunk_coordinates(worker.position)] = turn.tick
         for chunk, last_seen in tuple(self.scout_chunk_last_seen.items()):
@@ -4269,7 +4310,6 @@ class CoreFarmer:
             )
         )
         empty_workers = [worker for worker in workers if worker.cargo == 0]
-        self._refresh_healing_defenders(turn, combat_target)
         healing_holds = {
             defender.id
             for defender in (*turn.vanguards, *turn.rangers)
@@ -4316,6 +4356,7 @@ class CoreFarmer:
                 context,
                 enemies,
                 force_departure=reserve_core_for_spawn,
+                excluded_ids=self.worker_conversion_ids,
             )
         )
         preplanned_units.update(moving_core_lane_units)
@@ -4330,25 +4371,6 @@ class CoreFarmer:
             else:
                 mode = "DELIVERY_CHAIN_CLEAR"
             self._set_worker_mode(worker, mode, core.position)
-        if spawn_reservation in {UnitType.VANGUARD, UnitType.RANGER}:
-            swap_worker = self._select_emergency_swap_worker(
-                turn,
-                mobile_enemies,
-                retreat_enemies,
-                preplanned_units,
-                core_cell_occupants=context.friendly_counts[core.position],
-            )
-            if swap_worker is not None:
-                swap_worker.self_destruct()
-                self.emergency_swap_worker_id = swap_worker.id
-                preplanned_units.add(swap_worker.id)
-                context.friendly_counts[swap_worker.position] -= 1
-                self._set_worker_mode(
-                    swap_worker,
-                    "EMERGENCY_SWAP",
-                    core.position,
-                )
-        self._refresh_resource_memory(turn)
         resource_route_blocked = (
             set(context.obstacles)
             | set(context.enemy_cells)
@@ -4518,6 +4540,7 @@ class CoreFarmer:
         self._control_vanguards(
             turn,
             enemies,
+            retreat_enemies,
             context,
             combat_target,
             raid_launched=raid_launched,
@@ -4773,22 +4796,6 @@ class CoreFarmer:
             self.expedition_members[expedition_id] = members
         return tuple(orders)
 
-    def _friendly_beacon_carrier(self, turn: Turn) -> object | None:
-        carrier_id = turn.beacon.carrier_id
-        if carrier_id is None:
-            return None
-        return next(
-            (unit for unit in turn.units if unit.id == carrier_id),
-            None,
-        )
-
-    def _beacon_within_reach(self, turn: Turn) -> bool:
-        core = turn.core
-        return core is not None and (
-            _distance(core.position, turn.beacon.position)
-            <= BEACON_CAMPAIGN_MAX_DISTANCE
-        )
-
     def _beacon_campaign_ready(self, turn: Turn, target: object | None) -> bool:
         core = turn.core
         guard_vanguards, _ = _core_guard_ids(turn)
@@ -4799,7 +4806,7 @@ class CoreFarmer:
             and core.view.state is CoreState.NORMAL
             and core.hp == 5
             and core.shield >= 5
-            and self._beacon_within_reach(turn)
+            and len(turn.units) >= BEACON_CAMPAIGN_POPULATION
             and turn.resources >= BEACON_CAMPAIGN_RESOURCES
             and len(turn.vanguards) > len(guard_vanguards)
             and not self.threat_assessment.recent_core_attack
@@ -4807,13 +4814,6 @@ class CoreFarmer:
         )
 
     def _select_beacon_runner(self, turn: Turn, target: object | None) -> None:
-        carrier = self._friendly_beacon_carrier(turn)
-        if carrier is not None:
-            # Already holding it: the run is over and the outpost logic takes
-            # over, so distance and resource gates no longer apply.
-            self.beacon_runner_id = carrier.id
-            return
-        self.beacon_outpost_position = None
         if not self._beacon_campaign_ready(turn, target):
             self.beacon_runner_id = None
             return
@@ -4833,106 +4833,6 @@ class CoreFarmer:
                 _uuid_sort_key(unit),
             ),
         ).id
-
-    @staticmethod
-    def _beacon_cell_exposure(cell: Position, obstacles: set[Position]) -> int:
-        """Count the cells a Ranger could legally fire into `cell` from.
-
-        Only obstacles block a shot, so this is the number of open blind-fire
-        lanes onto a carrier standing here. Zero means terrain fully denies the
-        eight-direction range 1-3 envelope.
-        """
-        exposure = 0
-        for dx, dy in RANGER_LINE_VECTORS:
-            for distance in range(1, 4):
-                shooter = (cell[0] + dx * distance, cell[1] + dy * distance)
-                if shooter in obstacles:
-                    break
-                exposure += 1
-        return exposure
-
-    def _beacon_outpost_valid(
-        self,
-        cell: Position,
-        core_position: Position,
-        context: MovementContext,
-    ) -> bool:
-        return (
-            _is_signed_int64_position(cell)
-            and _distance(cell, core_position)
-            >= BEACON_OUTPOST_MIN_CORE_DISTANCE
-            and cell not in context.obstacles
-            and cell not in context.enemy_cells
-            and cell not in context.danger_cells
-            and cell not in context.allied_cells
-        )
-
-    def _beacon_outpost_position(
-        self,
-        turn: Turn,
-        carrier: object,
-        context: MovementContext,
-    ) -> Position:
-        """Choose a still, low-exposure cell well away from the Core.
-
-        A static Beacon coordinate is indistinguishable from one lying on the
-        ground, so holding still hides that anyone is carrying it. Standing
-        still also makes the carrier a fixed blind-fire target, so prefer cells
-        whose eight-direction firing lanes terrain already blocks.
-        """
-        core = turn.core
-        if core is None:
-            return carrier.position
-        cached = self.beacon_outpost_position
-        if cached is not None and self._beacon_outpost_valid(
-            cached,
-            core.position,
-            context,
-        ):
-            return cached
-
-        best: tuple[object, ...] | None = None
-        best_cell: Position | None = None
-        for dx in range(
-            -BEACON_OUTPOST_SEARCH_RADIUS,
-            BEACON_OUTPOST_SEARCH_RADIUS + 1,
-        ):
-            for dy in range(
-                -BEACON_OUTPOST_SEARCH_RADIUS,
-                BEACON_OUTPOST_SEARCH_RADIUS + 1,
-            ):
-                cell = (carrier.position[0] + dx, carrier.position[1] + dy)
-                if not self._beacon_outpost_valid(cell, core.position, context):
-                    continue
-                if cell != carrier.position and context.friendly_counts[cell] >= 2:
-                    continue
-                key = (
-                    self._beacon_cell_exposure(cell, context.obstacles),
-                    _distance(carrier.position, cell),
-                    cell,
-                )
-                if best is None or key < best:
-                    best = key
-                    best_cell = cell
-        if best_cell is not None:
-            self.beacon_outpost_position = best_cell
-            return best_cell
-
-        # Still inside the Core's broadcast radius: walk directly outward until
-        # a legal outpost comes into range.
-        away = (
-            carrier.position[0] - core.position[0],
-            carrier.position[1] - core.position[1],
-        )
-        if away == (0, 0):
-            away = (1, 0)
-        norm = abs(away[0]) + abs(away[1])
-        scale = -(-(BEACON_OUTPOST_MIN_CORE_DISTANCE + 2) // norm)
-        target = (
-            core.position[0] + away[0] * scale,
-            core.position[1] + away[1] * scale,
-        )
-        return target if _is_signed_int64_position(target) else carrier.position
 
     def _combat_patrol_target(
         self,
@@ -5553,6 +5453,7 @@ class CoreFarmer:
         self,
         turn: Turn,
         enemies: Sequence[object],
+        retreat_enemies: Sequence[object],
         context: MovementContext,
         isolated_core_target: object | None,
         *,
@@ -5709,6 +5610,14 @@ class CoreFarmer:
                 and _distance(vanguard.position, core.position)
                 > VANGUARD_GUARD_RADIUS
             ):
+                if _queue_away_from_enemies(
+                    vanguard,
+                    retreat_enemies,
+                    context,
+                    turn.beacon.position,
+                    keep_core_neighbors_clear=True,
+                ):
+                    continue
                 if not _queue_toward(
                     vanguard,
                     core.position,
@@ -5723,6 +5632,21 @@ class CoreFarmer:
                 and vanguard.id not in self.squad_return_ids
             )
             if strike_member:
+                if _locally_outnumbered(
+                    vanguard,
+                    (*turn.vanguards, *turn.rangers),
+                    retreat_enemies,
+                ):
+                    self.squad_return_ids.add(vanguard.id)
+                    if not _queue_away_from_enemies(
+                        vanguard,
+                        retreat_enemies,
+                        context,
+                        turn.beacon.position,
+                        keep_core_neighbors_clear=True,
+                    ):
+                        vanguard.wait()
+                    continue
                 if moving_worker_position is not None and hunt_has_ranger:
                     if not _queue_toward(
                         vanguard,
@@ -5807,15 +5731,10 @@ class CoreFarmer:
                 continue
             if vanguard.id == self.beacon_runner_id:
                 if turn.beacon.carrier_id == vanguard.id:
-                    outpost = self._beacon_outpost_position(
-                        turn,
-                        vanguard,
-                        context,
-                    )
-                    if outpost != vanguard.position and _queue_toward(
-                        vanguard,
-                        outpost,
-                        context,
+                    if (
+                        _distance(vanguard.position, core.position)
+                        > BEACON_RETURN_RADIUS
+                        and _queue_toward(vanguard, core.position, context)
                     ):
                         continue
                     vanguard.wait()
@@ -5833,6 +5752,12 @@ class CoreFarmer:
             nearby_enemies = [
                 enemy
                 for enemy in avoidance_enemies
+                if _distance(vanguard.position, enemy.position)
+                <= UNIT_EVADE_TRIGGER_DISTANCE
+            ]
+            nearby_retreat_enemies = [
+                enemy
+                for enemy in retreat_enemies
                 if _distance(vanguard.position, enemy.position)
                 <= UNIT_EVADE_TRIGGER_DISTANCE
             ]
@@ -5876,7 +5801,7 @@ class CoreFarmer:
                 continue
             if _queue_away_from_enemies(
                 vanguard,
-                nearby_enemies,
+                nearby_retreat_enemies,
                 context,
                 turn.beacon.position,
                 keep_core_neighbors_clear=True,
@@ -6656,100 +6581,157 @@ class CoreFarmer:
             self.last_core_cancel_reason = "BEACON_APPROACH"
         return cancel_for_beacon
 
-    def _population_cap(self) -> int:
-        return (
-            self.worker_target
-            + DEFENSE_VANGUARD_TARGET
-            + DEFENSE_RANGER_TARGET
+    def _refresh_worker_conversion_phase(self, turn: Turn) -> None:
+        if self.recovery_mode or self.production_weights is not None:
+            self.worker_conversion_active = False
+        elif (
+            not self.worker_conversion_active
+            and self.worker_target > WORKER_CONVERSION_TARGET
+            and len(turn.workers) > WORKER_CONVERSION_TARGET
+            and len(turn.vanguards) >= WORKER_CONVERSION_MIN_VANGUARDS
+            and len(turn.rangers) >= WORKER_CONVERSION_MIN_RANGERS
+        ):
+            self.worker_conversion_active = True
+        self.effective_worker_target = (
+            min(self.worker_target, WORKER_CONVERSION_TARGET)
+            if self.worker_conversion_active
+            else self.worker_target
         )
 
-    def _emergency_swap_candidates(
+    def _conversion_unit_type(self, turn: Turn) -> UnitType | None:
+        _, target_vanguards, target_rangers = _force_stage_targets(
+            self.effective_worker_target,
+            len(turn.workers),
+            len(turn.vanguards),
+            len(turn.rangers),
+        )
+        if len(turn.rangers) < target_rangers:
+            return UnitType.RANGER
+        if len(turn.vanguards) < target_vanguards:
+            return UnitType.VANGUARD
+        return None
+
+    def _plan_worker_conversion(
         self,
         turn: Turn,
-        excluded_ids: set[UUID] | None = None,
-    ) -> tuple[object, ...]:
-        excluded = excluded_ids if excluded_ids is not None else set()
-        return tuple(
-            worker
-            for worker in turn.workers
-            if worker.cargo == 0
-            and worker.id != turn.beacon.carrier_id
-            and worker.id != self.core_raid_spotter_id
-            and worker.id not in excluded
-        )
-
-    def _emergency_swap_possible(self, turn: Turn) -> bool:
-        return (
-            len(turn.workers)
-            > min(EMERGENCY_SWAP_MIN_WORKERS, self.worker_target)
-            and bool(self._emergency_swap_candidates(turn))
-        )
-
-    def _select_emergency_swap_worker(
-        self,
-        turn: Turn,
-        mobile_enemies: Sequence[object],
-        retreat_enemies: Sequence[object],
-        excluded_ids: set[UUID],
-        *,
-        core_cell_occupants: int,
-    ) -> object | None:
-        """Pick the Worker traded for an emergency combat spawn at the cap.
-
-        A Unit self-destruct resolves before movement and combat, so the spawn
-        later in the same Tick is priced with the reduced population. Swap only
-        when the Core action will really be the spawn: a projected shield
-        breach hands the Core action to HEAL, and a blocked Core cell defers
-        the spawn, so both cancel the sacrifice.
-        """
+        nearest_threat: int | None,
+        previous_worker_modes: Mapping[UUID, str],
+        combat_target: object | None,
+    ) -> None:
+        self.worker_conversion_ids.clear()
+        self.worker_conversion_unit_type = None
         core = turn.core
+        excess_workers = len(turn.workers) - self.effective_worker_target
         if (
             core is None
-            or len(turn.units) < self._population_cap()
-            or not self._emergency_swap_possible(turn)
+            or not self.worker_conversion_active
+            or excess_workers <= 0
+            or (
+                self.startup_tick is not None
+                and turn.tick <= self.startup_tick
+            )
+            or core.view.state is not CoreState.NORMAL
+            or core.hp < 5
+            or core.shield < 5
+            or self.compatibility_hold
+            or self.recovery_mode
+            or self.production_weights is not None
+            or self.manual_core_order_active
+            or self.healing_defender_ids
+            or self._core_defense_active(nearest_threat)
+            or turn.tick <= self.recent_core_attack_until_tick
+            or self._alliance_rally_target(turn) is not None
+            or (
+                self.beacon_policy == "pursue"
+                and self._beacon_campaign_ready(turn, combat_target)
+                and core.position == turn.beacon.position
+                and turn.beacon.status is BeaconStatus.GROUND
+            )
         ):
-            return None
-        nearest_threat = min(
+            return
+
+        next_unit = self._conversion_unit_type(turn)
+        if next_unit is None:
+            return
+        protected_ids = (
+            self.manual_claimed_unit_ids
+            | self.scout_return_ids
+            | {
+                identifier
+                for identifier in (
+                    self.beacon_runner_id,
+                    self.core_raid_spotter_id,
+                )
+                if identifier is not None
+            }
+        )
+        candidates = sorted(
             (
-                _distance(core.position, enemy.position)
-                for enemy in retreat_enemies
-            ),
-            default=None,
-        )
-        if not self._core_defense_active(nearest_threat):
-            return None
-        if (
-            _projected_core_damage(
-                core.position,
-                mobile_enemies,
-                self.known_obstacles,
-            )
-            > core.shield
-        ):
-            return None
-        candidates = self._emergency_swap_candidates(turn, excluded_ids)
-        if core_cell_occupants >= 2:
-            candidates = tuple(
                 worker
-                for worker in candidates
-                if worker.position == core.position
-            )
-        if not candidates:
-            return None
-
-        def exposure(worker: object) -> int:
-            return min(
-                (
-                    _distance(worker.position, enemy.position)
-                    for enemy in retreat_enemies
+                for worker in turn.workers
+                if worker.cargo == 0
+                and worker.id not in protected_ids
+                and worker.position not in turn.resource_cells
+                and previous_worker_modes.get(worker.id)
+                not in WORKER_CONVERSION_PRODUCTIVE_MODES
+                and (
+                    worker.id not in self.resource_intents
+                    or _distance(
+                        worker.position,
+                        self.resource_intents[worker.id],
+                    )
+                    > CORE_BULK_CARGO_ETA
+                )
+            ),
+            key=lambda worker: (
+                previous_worker_modes.get(worker.id)
+                not in {
+                    "SCOUT_BLOCKED",
+                    "RESOURCE_BLOCKED",
+                    "CLEAR_CORE_BLOCKED",
+                },
+                worker.id in self.resource_intents,
+                -_distance(
+                    worker.position,
+                    self.resource_intents.get(worker.id, worker.position),
                 ),
-                default=SIGNED_INT64_MAX,
-            )
-
-        return min(
-            candidates,
-            key=lambda worker: (exposure(worker), _uuid_sort_key(worker)),
+                _distance(worker.position, core.position),
+                _uuid_sort_key(worker),
+            ),
         )
+        max_batch = min(
+            WORKER_CONVERSION_BATCH_LIMIT,
+            excess_workers,
+            len(candidates),
+        )
+        if max_batch == 0:
+            return
+
+        population = len(turn.units)
+        current_cost = unit_cost(next_unit, population)
+        batch_size = 0
+        for candidate_size in range(1, max_batch + 1):
+            if unit_cost(next_unit, population - candidate_size) < current_cost:
+                batch_size = candidate_size
+                break
+        if batch_size == 0:
+            return
+        projected_population = population - batch_size
+        projected_capacity = core_resource_capacity(projected_population)
+        required_resources = min(
+            projected_capacity,
+            CORE_RESOURCE_RESERVE + unit_cost(next_unit, projected_population),
+        )
+        if (
+            turn.resources > projected_capacity
+            or turn.resources < required_resources
+        ):
+            return
+
+        self.worker_conversion_ids = {
+            worker.id for worker in candidates[:batch_size]
+        }
+        self.worker_conversion_unit_type = next_unit
 
     def _spawn_unit_type(
         self,
@@ -6763,25 +6745,35 @@ class CoreFarmer:
             or self.compatibility_hold
         ):
             return None
-        population = len(turn.units)
-        emergency_spawn = self._core_defense_active(nearest_threat)
-        swap_spawn = (
-            population >= self._population_cap()
-            and emergency_spawn
-            and self._emergency_swap_possible(turn)
+        population = len(turn.units) - len(self.worker_conversion_ids)
+        projected_workers = len(turn.workers) - len(self.worker_conversion_ids)
+        if (
+            self.worker_conversion_active
+            and projected_workers > self.effective_worker_target
+            and not self.worker_conversion_ids
+            and self.startup_tick is not None
+            and turn.tick <= self.startup_tick
+            and not self._core_defense_active(nearest_threat)
+        ):
+            return None
+        target_population = (
+            max(self.effective_worker_target, projected_workers)
+            + DEFENSE_VANGUARD_TARGET
+            + DEFENSE_RANGER_TARGET
         )
-        if population >= self._population_cap() and not swap_spawn:
+        if population >= target_population:
             return None
 
-        next_unit = _next_force_unit_type(
-            self.worker_target,
-            len(turn.workers),
+        next_unit = self.worker_conversion_unit_type or _next_force_unit_type(
+            self.effective_worker_target,
+            projected_workers,
             len(turn.vanguards),
             len(turn.rangers),
         )
-        if next_unit is None and not swap_spawn:
+        if next_unit is None:
             return None
 
+        emergency_spawn = self._core_defense_active(nearest_threat)
         if emergency_spawn:
             guard_vanguards, guard_rangers = _core_guard_ids(turn)
             local_vanguards = sum(
@@ -6864,10 +6856,9 @@ class CoreFarmer:
             )
             else CORE_RESOURCE_RESERVE
         )
-        pricing_population = population - 1 if swap_spawn else population
         threshold = min(
             turn.resource_capacity,
-            reserve + unit_cost(next_unit, pricing_population),
+            reserve + unit_cost(next_unit, population),
         )
         return next_unit if turn.resources >= threshold else None
 
@@ -6946,6 +6937,29 @@ class CoreFarmer:
             self._refresh_threat_assessment(turn, breakout=True)
         if core.view.state is CoreState.MOVING:
             if (
+                not self.alliance_rally_enabled
+                and self.active_core_move_reason in {None, "ALLY_RALLY"}
+                and not self.manual_core_order_active
+                and not retreat_enemies
+                and self.alliance_coordinator is not None
+                and self.alliance_leader is not None
+                and self.alliance_leader.account_id
+                != self.alliance_coordinator.account_id
+                and self.alliance_leader.core_position is not None
+                and core.view.destination is not None
+                and _distance(
+                    core.view.destination,
+                    self.alliance_leader.core_position,
+                )
+                < _distance(core.position, self.alliance_leader.core_position)
+            ):
+                core.cancel_move()
+                self.last_core_cancel_reason = "RALLY_DISABLED"
+                self.last_core_move_tick = turn.tick
+                self.last_retreat_direction = None
+                self.active_core_move_reason = None
+                return
+            if (
                 self.compatibility_hold
                 and self.active_core_move_reason != "EVADE"
             ):
@@ -7010,12 +7024,6 @@ class CoreFarmer:
             return
 
         next_unit = self._spawn_unit_type(turn, nearest_threat)
-        if (
-            next_unit is not None
-            and len(turn.units) >= self._population_cap()
-            and self.emergency_swap_worker_id is None
-        ):
-            next_unit = None
         if (
             can_spawn
             and core.hp == 5
@@ -7345,7 +7353,6 @@ def _position_diagnostics(turn: Turn, tactic: CoreFarmer) -> str:
         f"delivery_blocked={delivery_blocked} "
         f"resource_blocked={resource_blocked} "
         f"scout_chunks={len(tactic.scout_chunk_last_seen)} "
-        f"survey_chunks={len(tactic._survey_centers_for_region())} "
         f"scout_oldest_age={scout_oldest_age} "
         f"captured_resources={captured_resources} "
         f"capture_destroyed={capture_destroyed} "
@@ -7382,7 +7389,6 @@ def _position_diagnostics(turn: Turn, tactic: CoreFarmer) -> str:
         f"scout_return={len(tactic.scout_return_ids)} "
         f"squad_disengage_until={tactic.squad_disengage_until_tick} "
         f"healing_defenders={len(tactic.healing_defender_ids)} "
-        f"emergency_swap={int(tactic.emergency_swap_worker_id is not None)} "
         f"compatibility_hold={int(tactic.compatibility_hold)} "
         f"threat_caution_until={tactic.threat_caution_until_tick} "
         f"core_cancel_reason={tactic.last_core_cancel_reason} "
@@ -7540,7 +7546,6 @@ def play(
     alliance_roster_token_file: Path | None = None,
     alliance_roster_refresh_seconds: float = 15.0,
     alliance_roster_timeout_seconds: float = 5.0,
-    survey_region: tuple[Position, Position] | None = None,
 ) -> None:
     if (
         not math.isfinite(stale_turn_timeout_seconds)
@@ -7594,7 +7599,6 @@ def play(
         compatibility_marker=compatibility_marker,
         alliance_coordinator=alliance_coordinator,
         alliance_roster_client=alliance_roster_client,
-        survey_region=survey_region,
     )
     last_accepted_tick: int | None = None
     resource_ledger_snapshot: ResourceLedgerSnapshot | None = None
@@ -7641,6 +7645,11 @@ def play(
                     else None
                 )
                 alliance_config = control_config.get("alliance")
+                tactic.alliance_rally_enabled = bool(
+                    alliance_config["rally_enabled"]
+                    if isinstance(alliance_config, Mapping)
+                    else False
+                )
                 tactic.alliance_rally_radius = (
                     int(alliance_config["rally_radius"])
                     if isinstance(alliance_config, Mapping)
@@ -7650,15 +7659,16 @@ def play(
                     str(order.get("unit_type")) == "CORE"
                     for order in active_orders
                 )
-                tactic.revenge_usernames = (
-                    set(history.revenge_usernames()) if history is not None else set()
-                )
-                tactic.choose_actions(turn)
                 claimed_ids = {
                     UUID(str(unit_id))
                     for order in active_orders
                     for unit_id in order.get("unit_ids", ())
                 }
+                tactic.manual_claimed_unit_ids = claimed_ids
+                tactic.revenge_usernames = (
+                    set(history.revenge_usernames()) if history is not None else set()
+                )
+                tactic.choose_actions(turn)
                 expedition_orders = tactic.expedition_orders(
                     turn,
                     control_config.get("expeditions", ()),
@@ -7779,16 +7789,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("hold", "pursue", "retreat"),
         default=DEFAULT_BEACON_POLICY,
     )
-    parser.add_argument(
-        "--survey-region",
-        type=_parse_survey_region,
-        default=None,
-        metavar="X1,Y1,X2,Y2",
-        help=(
-            "Sweep Workers across the chunks covering this rectangle, "
-            "least recently seen first, instead of the outward scout rays."
-        ),
-    )
     marker_group = parser.add_mutually_exclusive_group()
     marker_group.add_argument(
         "--compatibility-marker",
@@ -7888,7 +7888,6 @@ def main(argv: list[str] | None = None) -> int:
             base_url=args.base_url,
             worker_target=args.worker_target,
             beacon_policy=args.beacon_policy,
-            survey_region=args.survey_region,
             compatibility_marker=args.compatibility_marker,
             heartbeat_file=args.heartbeat_file,
             history_db=args.history_db,

@@ -101,6 +101,31 @@ button:focus-visible, input:focus-visible, canvas:focus-visible { outline: 2px s
   text-overflow: ellipsis;
 }
 
+.account-status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 14px;
+  background: #0b1013;
+  border-bottom: 1px solid var(--border);
+}
+
+.account-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 32px;
+  padding: 0 9px;
+  color: #dce8ed;
+  border-color: #326477;
+  background: #12232a;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.account-summary.secondary { border-color: #805866; background: #281b20; }
+.account-summary:disabled { cursor: default; opacity: 0.7; }
+
 .status-events-heading {
   margin: 0;
   padding: 10px 14px;
