@@ -187,6 +187,11 @@ DEFAULT_ALLIANCE_STALE_SECONDS = 60.0
 DEFAULT_ALLIANCE_BARRIER_TIMEOUT_SECONDS = 1.0
 ALLIANCE_ROSTER_USER_AGENT = "arena-hero-agent/1.0"
 ALLY_CORE_RALLY_RADIUS = 12
+ALLY_DEFENSE_RESPONSE_RADIUS = 30
+ALLY_DEFENSE_MAX_UNITS = 4
+ALLY_DEFENSE_ENGAGE_RADIUS = 6
+ALLY_DEFENSE_MISSION_TTL_TICKS = 8
+ALLY_DEFENSE_THREAT_CELL_LIMIT = 8
 TURN_SKIP_API_ERRORS = frozenset(
     {
         "COMMAND_RATE_LIMITED",
@@ -346,6 +351,16 @@ class RememberedThreat:
 
 
 @dataclass(slots=True, frozen=True)
+class AllianceDefenseRequest:
+    """Ally-published defense summary used to coordinate mutual aid."""
+
+    under_attack: bool
+    posture: str = "NORMAL"
+    threat_level: str = "NORMAL"
+    threat_cells: tuple[Position, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
 class AlliancePeer:
     account_id: str
     alliance_id: str
@@ -358,6 +373,38 @@ class AlliancePeer:
     unit_positions: frozenset[Position]
     scout_chunks: tuple[tuple[Position, int], ...]
     updated_at: float
+    defense: AllianceDefenseRequest | None = None
+
+
+def _parse_alliance_defense(value: object) -> AllianceDefenseRequest | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        return None
+    raw_cells = value.get("threat_cells", ())
+    cells: list[Position] = []
+    if isinstance(raw_cells, list):
+        for entry in raw_cells:
+            if (
+                isinstance(entry, list)
+                and len(entry) == 2
+                and not any(isinstance(item, bool) for item in entry)
+                and all(isinstance(item, int) for item in entry)
+                and _is_signed_int64_position((entry[0], entry[1]))
+            ):
+                cells.append((entry[0], entry[1]))
+            if len(cells) >= ALLY_DEFENSE_THREAT_CELL_LIMIT:
+                break
+    try:
+        under_attack = bool(value.get("under_attack", False))
+    except (TypeError, ValueError):
+        return None
+    return AllianceDefenseRequest(
+        under_attack=under_attack,
+        posture=str(value.get("posture", "NORMAL"))[:32],
+        threat_level=str(value.get("threat_level", "NORMAL"))[:32],
+        threat_cells=tuple(cells),
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -538,6 +585,7 @@ class AllianceCoordinator:
         turn: Turn,
         *,
         scout_chunks: Mapping[Position, int] | None = None,
+        defense: AllianceDefenseRequest | None = None,
     ) -> None:
         core = turn.core
         recent_scout_chunks = sorted(
@@ -575,6 +623,15 @@ class AllianceCoordinator:
             ],
             "updated_at": time.time(),
         }
+        if defense is not None:
+            state["defense"] = {
+                "under_attack": bool(defense.under_attack),
+                "posture": str(defense.posture)[:32],
+                "threat_level": str(defense.threat_level)[:32],
+                "threat_cells": [
+                    [cell[0], cell[1]] for cell in defense.threat_cells
+                ],
+            }
         self.directory.mkdir(parents=True, exist_ok=True)
         temporary = self.directory / (
             f".{self.account_id}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -655,6 +712,7 @@ class AllianceCoordinator:
                         ),
                         scout_chunks=tuple(scout_chunks),
                         updated_at=updated_at,
+                        defense=_parse_alliance_defense(raw.get("defense")),
                     )
                 )
             except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
@@ -2141,6 +2199,11 @@ class CoreFarmer:
         self.alliance_leader: AlliancePeer | None = None
         self.alliance_rally_enabled = False
         self.alliance_rally_radius = ALLY_CORE_RALLY_RADIUS
+        self.alliance_defense_enabled = True
+        self.alliance_defense_request: AllianceDefenseRequest | None = None
+        self.alliance_defense_peer_id: str | None = None
+        self.alliance_defense_updated_tick = 0
+        self.alliance_defense_ids: set[UUID] = set()
         self.alliance_turn_tick: int | None = None
         self.compatibility_hold = False
         self.known_obstacles: set[Position] = set()
@@ -2217,6 +2280,11 @@ class CoreFarmer:
         peers: tuple[AlliancePeer, ...] = ()
         if coordinator is not None:
             try:
+                defense = (
+                    self._defense_broadcast(turn)
+                    if coordinator.expected_members > 1
+                    else None
+                )
                 coordinator.publish(
                     turn,
                     scout_chunks=(
@@ -2224,6 +2292,7 @@ class CoreFarmer:
                         if coordinator.expected_members > 1
                         else None
                     ),
+                    defense=defense,
                 )
                 deadline = time.monotonic() + coordinator.barrier_timeout_seconds
                 while True:
@@ -2395,6 +2464,221 @@ class CoreFarmer:
             if viable
             else None
         )
+
+    def _defense_broadcast(self, turn: Turn) -> AllianceDefenseRequest:
+        """Summarize this account's defense state for alliance peers.
+
+        Runs before this Turn's awareness update, so it combines the previous
+        assessment with fresh attack events that arrived with this Turn.
+        """
+        core = turn.core
+        fresh_attack = any(
+            getattr(event, "actor_id", None) not in self.allied_object_ids
+            and event.reason_code == "ATTACK"
+            and event.event_type in {"CORE_DAMAGED", "UNIT_DAMAGED"}
+            for event in turn.events
+        )
+        assessment = self.threat_assessment
+        under_attack = bool(
+            fresh_attack
+            or assessment.level in {ThreatLevel.ENGAGED, ThreatLevel.BREAKOUT}
+            or self.recent_core_attack_until_tick > turn.tick
+        )
+        threat_cells: list[Position] = []
+        if core is not None:
+            hostile_cells = sorted(
+                {
+                    enemy.position
+                    for enemy in turn.visible_enemies
+                    if enemy.id not in self.allied_object_ids
+                    and (
+                        getattr(enemy, "kind") != "CORE"
+                        or getattr(enemy, "owner_username", "")
+                        not in self.allied_usernames
+                    )
+                },
+                key=lambda cell: (_distance(cell, core.position), cell),
+            )
+            threat_cells = [
+                cell
+                for cell in hostile_cells
+                if _distance(cell, core.position) <= CORE_EVADE_TRIGGER_DISTANCE
+            ][:ALLY_DEFENSE_THREAT_CELL_LIMIT]
+        return AllianceDefenseRequest(
+            under_attack=under_attack,
+            posture=assessment.global_posture.value,
+            threat_level=assessment.level.value,
+            threat_cells=tuple(threat_cells),
+        )
+
+    def _select_alliance_defense_request(
+        self,
+        turn: Turn,
+    ) -> tuple[AlliancePeer, AllianceDefenseRequest] | None:
+        coordinator = self.alliance_coordinator
+        if coordinator is None or turn.core is None:
+            return None
+        candidates: list[tuple[int, str, AlliancePeer]] = []
+        for peer in self.alliance_peers:
+            request = peer.defense
+            if (
+                peer.account_id == coordinator.account_id
+                or request is None
+                or not request.under_attack
+                or peer.core_position is None
+                or peer.tick < turn.tick
+            ):
+                continue
+            if (
+                _distance(turn.core.position, peer.core_position)
+                > ALLY_DEFENSE_RESPONSE_RADIUS
+            ):
+                continue
+            sticky = 0 if peer.account_id == self.alliance_defense_peer_id else 1
+            candidates.append((sticky, peer.account_id, peer))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        peer = candidates[0][2]
+        assert peer.defense is not None
+        return peer, peer.defense
+
+    def _release_alliance_defense(self) -> None:
+        if self.alliance_defense_ids:
+            self.squad_return_ids.update(self.alliance_defense_ids)
+        self.alliance_defense_ids.clear()
+        self.alliance_defense_request = None
+        self.alliance_defense_peer_id = None
+
+    def _assign_alliance_defenders(
+        self,
+        turn: Turn,
+        anchor: Position,
+        isolated_core_target: object | None,
+    ) -> None:
+        guard_vanguards, guard_rangers = _core_guard_ids(turn)
+        reserve_vanguards, reserve_rangers = _core_reserve_ids(turn)
+        strike_vanguards, strike_rangers = self._strike_group_ids(
+            turn,
+            isolated_core_target,
+        )
+        expedition_ids = {
+            unit_id
+            for members in self.expedition_members.values()
+            for unit_id in members
+        }
+        excluded = (
+            guard_vanguards
+            | reserve_vanguards
+            | strike_vanguards
+            | expedition_ids
+            | self.healing_defender_ids
+            | self.manual_claimed_unit_ids
+            | self.worker_conversion_ids
+        ) | (
+            guard_rangers
+            | reserve_rangers
+            | strike_rangers
+            | expedition_ids
+            | self.manual_claimed_unit_ids
+        )
+        if self.beacon_runner_id is not None:
+            excluded.add(self.beacon_runner_id)
+        candidates = [
+            combat_unit
+            for combat_unit in (*turn.vanguards, *turn.rangers)
+            if combat_unit.id not in excluded
+        ]
+        candidates.sort(
+            key=lambda combat_unit: (
+                0 if combat_unit.id in self.alliance_defense_ids else 1,
+                _distance(combat_unit.position, anchor),
+                combat_unit.unit_type.value,
+                _uuid_sort_key(combat_unit),
+            )
+        )
+        self.alliance_defense_ids = {
+            combat_unit.id for combat_unit in candidates[:ALLY_DEFENSE_MAX_UNITS]
+        }
+
+    def _update_alliance_defense(
+        self,
+        turn: Turn,
+        isolated_core_target: object | None,
+    ) -> None:
+        """Dispatch spare defenders toward an ally broadcasting an attack."""
+        combat_ids = {unit.id for unit in (*turn.vanguards, *turn.rangers)}
+        self.alliance_defense_ids.intersection_update(combat_ids)
+        coordinator = self.alliance_coordinator
+        assessment = self.threat_assessment
+        mission_expired = (
+            turn.tick - self.alliance_defense_updated_tick
+            > ALLY_DEFENSE_MISSION_TTL_TICKS
+        )
+        if (
+            not self.alliance_defense_enabled
+            or coordinator is None
+            or coordinator.expected_members <= 1
+            or assessment.lifecycle is not LifecycleMode.ACTIVE
+            or assessment.level
+            in {ThreatLevel.PRE_EVADE, ThreatLevel.ENGAGED, ThreatLevel.BREAKOUT}
+            or mission_expired
+        ):
+            self._release_alliance_defense()
+            return
+        selected = self._select_alliance_defense_request(turn)
+        if selected is None:
+            self._release_alliance_defense()
+            return
+        peer, request = selected
+        if peer.account_id != self.alliance_defense_peer_id:
+            self._release_alliance_defense()
+        self.alliance_defense_peer_id = peer.account_id
+        self.alliance_defense_request = request
+        self.alliance_defense_updated_tick = turn.tick
+        anchor = peer.core_position
+        assert anchor is not None
+        self._assign_alliance_defenders(turn, anchor, isolated_core_target)
+
+    def _control_alliance_defender(
+        self,
+        defender: Movable,
+        context: MovementContext,
+        *,
+        ranged: bool,
+    ) -> bool:
+        request = self.alliance_defense_request
+        if request is None or defender.id not in self.alliance_defense_ids:
+            return False
+        anchor = request.core_position
+        hold_radius = RANGER_GUARD_RADIUS if ranged else VANGUARD_GUARD_RADIUS
+        engage_cells = [
+            cell
+            for cell in request.threat_cells
+            if _distance(cell, anchor) <= ALLY_DEFENSE_ENGAGE_RADIUS
+        ]
+        if engage_cells:
+            goal = min(
+                engage_cells,
+                key=lambda cell: (_distance(defender.position, cell), cell),
+            )
+            target_radius = 2 if ranged else 1
+        else:
+            goal = anchor
+            target_radius = hold_radius
+        if _distance(defender.position, goal) <= target_radius:
+            # Hold the assigned post; legal attacks are handled earlier.
+            defender.wait()
+            return True
+        if not _queue_toward(
+            defender,
+            goal,
+            context,
+            avoid_danger=True,
+            target_radius=target_radius,
+        ):
+            defender.wait()
+        return True
 
     def _hostile_enemies(self, turn: Turn) -> tuple[object, ...]:
         if not self.alliance_roster_ready:
@@ -3543,7 +3827,11 @@ class CoreFarmer:
         (
             self.unit_hunt_vanguard_ids,
             self.unit_hunt_ranger_ids,
-        ) = self._select_strike_group_ids(turn, target)
+        ) = self._select_strike_group_ids(
+            turn,
+            target,
+            excluded_ids=self.alliance_defense_ids,
+        )
         return target
 
     def _enter_recovery(self, tick: int, reason: str) -> None:
@@ -4261,6 +4549,7 @@ class CoreFarmer:
                 len(self.recent_attack_threats),
             )
             self._recall_core_defenders(turn, threat_count)
+        self._update_alliance_defense(turn, isolated_core_target)
 
         all_workers = sorted(turn.workers, key=_uuid_sort_key)
         previous_worker_modes = dict(self.worker_modes)
@@ -4859,6 +5148,8 @@ class CoreFarmer:
         turn: Turn,
         target: object | None,
         enemies: Sequence[object] | None = None,
+        *,
+        excluded_ids: frozenset[UUID] | set[UUID] = frozenset(),
     ) -> tuple[set[UUID], set[UUID]]:
         if target is None:
             return set(), set()
@@ -4869,6 +5160,7 @@ class CoreFarmer:
                 unit
                 for unit in turn.vanguards
                 if unit.id not in guard_vanguards
+                and unit.id not in excluded_ids
             ),
             key=lambda unit: (
                 _distance(unit.position, target.position),
@@ -4880,6 +5172,7 @@ class CoreFarmer:
                 unit
                 for unit in turn.rangers
                 if unit.id not in guard_rangers
+                and unit.id not in excluded_ids
             ),
             key=lambda unit: (
                 _distance(unit.position, target.position),
@@ -5019,6 +5312,7 @@ class CoreFarmer:
         selected_vanguards, selected_rangers = self._select_strike_group_ids(
             turn,
             target,
+            excluded_ids=self.alliance_defense_ids,
         )
         selected_vanguards.intersection_update(living_vanguards)
         selected_rangers.intersection_update(living_rangers)
@@ -5070,6 +5364,7 @@ class CoreFarmer:
             turn,
             target,
             self._hostile_enemies(turn),
+            excluded_ids=self.alliance_defense_ids,
         )
         needed_vanguards = max(
             0,
@@ -5127,6 +5422,7 @@ class CoreFarmer:
             turn,
             target,
             self._hostile_enemies(turn),
+            excluded_ids=self.alliance_defense_ids,
         )
 
     def _refresh_core_raid_launch(
@@ -5574,6 +5870,12 @@ class CoreFarmer:
                 if direction is not None:
                     vanguard.sweep(direction)
                     continue
+            if vanguard.id in self.alliance_defense_ids and self._control_alliance_defender(
+                vanguard,
+                context,
+                ranged=False,
+            ):
+                continue
             adjacent_enemies = [
                 enemy
                 for enemy in enemies
@@ -5986,6 +6288,12 @@ class CoreFarmer:
                     key=lambda enemy: _combat_target_key(ranger.position, enemy),
                 )
                 ranger.shoot(pursuer)
+                continue
+            if ranger.id in self.alliance_defense_ids and self._control_alliance_defender(
+                ranger,
+                context,
+                ranged=True,
+            ):
                 continue
             return_shootable = [
                 enemy
@@ -7654,6 +7962,11 @@ def play(
                     int(alliance_config["rally_radius"])
                     if isinstance(alliance_config, Mapping)
                     else ALLY_CORE_RALLY_RADIUS
+                )
+                tactic.alliance_defense_enabled = bool(
+                    alliance_config.get("defense_enabled", True)
+                    if isinstance(alliance_config, Mapping)
+                    else True
                 )
                 tactic.manual_core_order_active = any(
                     str(order.get("unit_type")) == "CORE"
