@@ -9,12 +9,6 @@
 <body>
   <header class="topbar">
     <div class="brand">Arena Hero 战术地图</div>
-    <div class="metrics" aria-live="polite">
-      <div id="account-status" class="account-status" aria-label="账号资源与兵力"></div>
-      <span>Tick <strong id="metric-tick">--</strong></span>
-      <span class="secondary-metric">态势 <strong id="metric-posture">--</strong></span>
-      <span class="secondary-metric">敌情 <strong id="metric-enemies">--</strong></span>
-    </div>
     <nav class="controls" aria-label="历史回放控制">
       <button id="previous-tick" class="icon-button" title="上一个 Tick" aria-label="上一个 Tick">‹</button>
       <button id="toggle-play" class="icon-button" title="播放历史" aria-label="播放历史">▶</button>
@@ -30,36 +24,41 @@
   <main class="workspace">
     <section class="map-region" aria-label="战术地图">
       <canvas id="map" tabindex="0"></canvas>
-      <div class="map-toolbar">
-        <button id="fit-map" type="button">适配全图</button>
-        <button id="home-map" type="button">回到 Core</button>
-        <label><input type="checkbox" data-map-layer="explored" checked> 已探索</label>
-        <label><input type="checkbox" data-map-layer="obstacles" checked> 障碍</label>
-        <label><input type="checkbox" data-map-layer="resources" checked> 资源</label>
-        <label><input type="checkbox" data-map-layer="history" checked> 历史</label>
-        <label><input type="checkbox" data-map-layer="routes"> 路线</label>
-        <div class="toolbar-divider"></div>
-		<div class="unit-filter-group" role="group" aria-label="兵种筛选">
-			<button type="button" class="unit-filter-btn active" data-unit-filter="ALL">全部</button>
-			<button type="button" class="unit-filter-btn" data-unit-filter="WORKER">工兵 W</button>
-			<button type="button" class="unit-filter-btn" data-unit-filter="VANGUARD">先锋 V</button>
-			<button type="button" class="unit-filter-btn" data-unit-filter="RANGER">游侠 R</button>
-		</div>
-		<div class="toolbar-divider"></div>
-			<label class="relative-coord-label">
-				<input type="checkbox" id="toggle-relative-coord"> 相对 Core 坐标
-			</label>
+      <div id="units-panel-container" class="units-panel-container">
+        <div id="units-panel" class="units-panel">
+        <div class="units-panel-header">
+          <h3>当前单位</h3>
+          <div class="unit-filter-group" role="group" aria-label="兵种筛选">
+            <button type="button" class="unit-filter-btn active" data-unit-filter="ALL">全部</button>
+            <button type="button" class="unit-filter-btn" data-unit-filter="WORKER">工人</button>
+            <button type="button" class="unit-filter-btn" data-unit-filter="VANGUARD">先锋</button>
+            <button type="button" class="unit-filter-btn" data-unit-filter="RANGER">游侠</button>
+          </div>
+        </div>
+        <ol id="unit-list" class="unit-list"></ol>
+        </div>
+        <button id="units-panel-toggle" class="units-panel-toggle" type="button" title="隐藏单位列表" aria-label="隐藏单位列表">‹</button>
+      </div>
+      <button id="panel-toggle" class="panel-toggle" type="button" title="隐藏右侧情报面板" aria-label="隐藏右侧情报面板">☰</button>
+      <div class="map-zoom-controls" aria-label="地图缩放">
+        <button id="map-zoom-in" class="icon-button" type="button" title="放大" aria-label="放大">+</button>
+        <button id="map-zoom-out" class="icon-button" type="button" title="缩小" aria-label="缩小">−</button>
+        <button id="map-zoom-home" class="icon-button" type="button" title="定位己方 Core" aria-label="定位己方 Core">⌖</button>
+        <button id="fit-map" class="fit-map-button" type="button" title="适配全图" aria-label="适配全图">全图</button>
+        <button id="legend-toggle" class="legend-toggle-button" type="button" title="切换图例" aria-label="切换图例">图例</button>
       </div>
       <div class="legend" aria-label="地图图例">
-        <span><i class="swatch explored"></i>已探索</span>
-        <span><i class="swatch obstacle"></i>障碍</span>
-        <span><i class="swatch resource"></i>当前资源</span>
-        <span><i class="swatch resource-history"></i>历史资源</span>
-        <span><i class="swatch friendly"></i>己方</span>
-        <span><i class="swatch ally"></i>盟友</span>
-        <span><i class="swatch enemy"></i>敌方</span>
-        <span><i class="swatch old-core"></i>历史 Core</span>
-        <span><i class="swatch beacon"></i>冠军信标</span>
+        <label class="legend-item"><input type="checkbox" data-map-layer="explored" checked><i class="swatch explored"></i>已探索</label>
+        <label class="legend-item"><input type="checkbox" data-map-layer="obstacles" checked><i class="swatch obstacle"></i>障碍</label>
+        <label class="legend-item"><input type="checkbox" data-map-layer="resources" checked><i class="swatch resource"></i>当前资源</label>
+        <label class="legend-item"><input type="checkbox" data-map-layer="history" checked><i class="swatch resource-history"></i>历史资源</label>
+        <label class="legend-item"><input type="checkbox" data-map-layer="routes"><i class="swatch routes"></i>路线</label>
+        <span class="legend-item"><i class="swatch friendly"></i>己方</span>
+        <span class="legend-item"><i class="swatch ally"></i>盟友</span>
+        <span class="legend-item"><i class="swatch enemy"></i>敌方</span>
+        <span class="legend-item"><i class="swatch old-core"></i>历史 Core</span>
+        <span class="legend-item"><i class="swatch beacon"></i>冠军信标</span>
+        <label class="legend-item relative-coord-label"><input type="checkbox" id="toggle-relative-coord">相对 Core 坐标</label>
       </div>
       <div id="map-status" class="map-status">等待历史数据</div>
       <div id="cursor-position" class="cursor-position">x -- · y --</div>
@@ -68,33 +67,37 @@
 
     <aside class="intel-panel">
       <div class="panel-tabs" role="tablist" aria-label="情报视图">
-        <button id="events-tab" class="panel-tab active" role="tab" aria-selected="true">事件</button>
-        <button id="ranking-tab" class="panel-tab" role="tab" aria-selected="false">排行榜</button>
+        <button id="status-tab" class="panel-tab active" role="tab" aria-selected="true">状态</button>
         <button id="control-tab" class="panel-tab" role="tab" aria-selected="false">调兵</button>
+        <button id="ranking-tab" class="panel-tab" role="tab" aria-selected="false">排行榜</button>
       </div>
-      <section id="events-panel" class="panel-view" role="tabpanel">
-        <ol id="event-list" class="event-list"></ol>
-      </section>
-      <section id="ranking-panel" class="panel-view hidden" role="tabpanel">
-        <div class="ranking-modes" role="tablist" aria-label="排行榜类型">
-          <button data-ranking="damage_dealt" class="ranking-mode active">伤害</button>
-          <button data-ranking="core_destruction_participations" class="ranking-mode">Core</button>
-          <button data-ranking="beacon_ticks_held" class="ranking-mode">信标</button>
+      <section id="status-panel" class="panel-view" role="tabpanel">
+        <div class="status-metrics">
+          <div class="metric"><span>Tick</span><strong id="status-tick">--</strong></div>
+          <div class="metric"><span>资源</span><strong id="status-resources">--/--</strong></div>
+          <div class="metric"><span>人口</span><strong id="status-population">--</strong></div>
+          <div class="metric"><span>兵力</span><strong id="status-force">--</strong></div>
+          <div class="metric"><span>态势</span><strong id="status-posture">--</strong></div>
+          <div class="metric"><span>敌情</span><strong id="status-enemies">--</strong></div>
         </div>
-        <ol id="ranking-list" class="ranking-list"></ol>
-      </section>
-      <section id="control-panel" class="panel-view hidden" role="tabpanel">
-		<div class="control-toolbar">
-			<button id="toggle-all-control" type="button" class="secondary-button">全部折叠</button>
-		</div>
+        <div id="account-status" class="account-status-bar" aria-label="账号资源与兵力"></div>
+
         <form id="production-form" class="config-form">
-          <h3>生产比例</h3>
+          <h3>生产比例 <span id="production-account-chip" class="account-chip">操作目标：大号</span></h3>
           <label>Worker <input id="production-worker" type="number" min="0" max="100" value="4" required></label>
           <label>Vanguard <input id="production-vanguard" type="number" min="0" max="100" value="1" required></label>
           <label>Ranger <input id="production-ranger" type="number" min="0" max="100" value="1" required></label>
           <button type="submit">保存生产配置</button>
           <p id="production-status" class="form-status" aria-live="polite"></p>
         </form>
+        <h4 class="status-events-heading">事件</h4>
+        <ol id="event-list" class="event-list"></ol>
+      </section>
+      <section id="control-panel" class="panel-view hidden" role="tabpanel">
+		<div class="control-toolbar">
+			<button id="toggle-all-control" type="button" class="secondary-button">全部折叠</button>
+			<span id="control-account-chip" class="account-chip">操作目标：大号</span>
+		</div>
         <form id="expedition-form" class="config-form">
           <h3>远征队</h3>
           <input id="expedition-id" type="hidden">
@@ -147,14 +150,17 @@
           <p id="order-status" class="form-status" aria-live="polite"></p>
         </form>
         <form id="alliance-form" class="config-form">
-          <h3>联盟靠拢</h3>
+          <h3>联盟协同</h3>
           <label class="wide checkbox-label">
             <input id="alliance-rally-enabled" type="checkbox"> 开启小号 Core 向大号靠拢
           </label>
           <label class="wide">与盟主保持距离（格）
             <input id="alliance-rally-radius" type="number" min="1" max="256" value="12" required>
           </label>
-          <button type="submit">保存联盟靠拢</button>
+          <label class="wide checkbox-label">
+            <input id="alliance-defense-enabled" type="checkbox" checked> 开启跨账号防御支援（队友被攻击时出兵驰援）
+          </label>
+          <button type="submit">保存联盟配置</button>
           <p id="alliance-status" class="form-status" aria-live="polite"></p>
         </form>
         <div class="control-section">
@@ -174,6 +180,14 @@
           <h3>调兵记录</h3>
           <ol id="order-list" class="event-list"></ol>
         </div>
+      </section>
+      <section id="ranking-panel" class="panel-view hidden" role="tabpanel">
+        <div class="ranking-modes" role="tablist" aria-label="排行榜类型">
+          <button data-ranking="damage_dealt" class="ranking-mode active">伤害</button>
+          <button data-ranking="core_destruction_participations" class="ranking-mode">Core</button>
+          <button data-ranking="beacon_ticks_held" class="ranking-mode">信标</button>
+        </div>
+        <ol id="ranking-list" class="ranking-list"></ol>
       </section>
     </aside>
   </main>

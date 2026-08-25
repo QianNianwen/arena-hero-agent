@@ -125,6 +125,26 @@ def _connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     return connection
 
 
+MAP_CELL_TABLES = ("explored_cells", "obstacle_cells", "resource_cells")
+
+
+def create_map_indexes(path: Path) -> bool:
+    """给三张格子表补建 first_seen_tick 索引；库不可写（如被占用）时返回 False。
+
+    HistoryRecorder 建表时也会建这些索引，这里覆盖 farmer 尚未重启的存量库。
+    """
+    try:
+        with closing(_connect(path)) as connection:
+            for table in MAP_CELL_TABLES:
+                connection.execute(
+                    f"CREATE INDEX IF NOT EXISTS {table}_first_seen_idx"
+                    f" ON {table} (first_seen_tick)"
+                )
+            return True
+    except sqlite3.OperationalError:
+        return False
+
+
 def _ensure_unit_orders_table(connection: sqlite3.Connection) -> None:
     existing = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'unit_orders'"
@@ -267,9 +287,11 @@ def _ensure_control_config_tables(connection: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY CHECK (id = 1),
             rally_enabled INTEGER NOT NULL DEFAULT 0,
             rally_radius INTEGER NOT NULL,
+            defense_enabled INTEGER NOT NULL DEFAULT 1,
             updated_at REAL NOT NULL,
             CHECK (rally_enabled IN (0, 1)),
-            CHECK (rally_radius BETWEEN 1 AND 256)
+            CHECK (rally_radius BETWEEN 1 AND 256),
+            CHECK (defense_enabled IN (0, 1))
         );
         """
     )
@@ -282,6 +304,12 @@ def _ensure_control_config_tables(connection: sqlite3.Connection) -> None:
             "ALTER TABLE alliance_config ADD COLUMN "
             "rally_enabled INTEGER NOT NULL DEFAULT 0 "
             "CHECK (rally_enabled IN (0, 1))"
+        )
+    if "defense_enabled" not in alliance_columns:
+        connection.execute(
+            "ALTER TABLE alliance_config ADD COLUMN "
+            "defense_enabled INTEGER NOT NULL DEFAULT 1 "
+            "CHECK (defense_enabled IN (0, 1))"
         )
         connection.commit()
 
@@ -502,6 +530,12 @@ class HistoryRecorder:
                 last_seen_tick INTEGER NOT NULL,
                 PRIMARY KEY (x, y)
             );
+            CREATE INDEX IF NOT EXISTS explored_cells_first_seen_idx
+                ON explored_cells (first_seen_tick);
+            CREATE INDEX IF NOT EXISTS obstacle_cells_first_seen_idx
+                ON obstacle_cells (first_seen_tick);
+            CREATE INDEX IF NOT EXISTS resource_cells_first_seen_idx
+                ON resource_cells (first_seen_tick);
             CREATE TABLE IF NOT EXISTS enemy_core_sightings (
                 core_id TEXT NOT NULL,
                 tick INTEGER NOT NULL,
@@ -870,17 +904,22 @@ def _read_control_config(
         """
     ).fetchall()
     alliance = connection.execute(
-        "SELECT rally_enabled, rally_radius, updated_at "
+        "SELECT rally_enabled, rally_radius, defense_enabled, updated_at "
         "FROM alliance_config WHERE id = 1"
     ).fetchone()
     return {
         "production": dict(production) if production is not None else None,
         "alliance": (
-            {**dict(alliance), "rally_enabled": bool(alliance["rally_enabled"])}
+            {
+                **dict(alliance),
+                "rally_enabled": bool(alliance["rally_enabled"]),
+                "defense_enabled": bool(alliance["defense_enabled"]),
+            }
             if alliance is not None
             else {
                 "rally_enabled": False,
                 "rally_radius": DEFAULT_ALLIANCE_RALLY_RADIUS,
+                "defense_enabled": True,
                 "updated_at": None,
             }
         ),
@@ -895,11 +934,14 @@ def save_alliance_config(
     *,
     rally_enabled: bool,
     rally_radius: int,
+    defense_enabled: bool = True,
 ) -> dict[str, object]:
     if not isinstance(rally_enabled, bool):
         raise ValueError("alliance rally enabled must be a boolean")
     if isinstance(rally_radius, bool) or not isinstance(rally_radius, int):
         raise ValueError("alliance rally radius must be an integer")
+    if not isinstance(defense_enabled, bool):
+        raise ValueError("alliance defense enabled must be a boolean")
     if not MIN_ALLIANCE_RALLY_RADIUS <= rally_radius <= MAX_ALLIANCE_RALLY_RADIUS:
         raise ValueError(
             "alliance rally radius must be between "
@@ -911,19 +953,26 @@ def save_alliance_config(
         connection.execute(
             """
             INSERT INTO alliance_config
-                (id, rally_enabled, rally_radius, updated_at)
-            VALUES (1, ?, ?, ?)
+                (id, rally_enabled, rally_radius, defense_enabled, updated_at)
+            VALUES (1, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 rally_enabled=excluded.rally_enabled,
                 rally_radius=excluded.rally_radius,
+                defense_enabled=excluded.defense_enabled,
                 updated_at=excluded.updated_at
             """,
-            (int(rally_enabled), rally_radius, updated_at),
+            (
+                int(rally_enabled),
+                rally_radius,
+                int(defense_enabled),
+                updated_at,
+            ),
         )
         connection.commit()
     return {
         "rally_enabled": rally_enabled,
         "rally_radius": rally_radius,
+        "defense_enabled": defense_enabled,
         "updated_at": updated_at,
     }
 
@@ -1171,12 +1220,40 @@ def revenge_usernames(path: Path) -> frozenset[str]:
             return frozenset()
 
 
+def read_map_cells_after(
+    path: Path,
+    table: str,
+    after_rowid: int,
+    *,
+    limit: int = 20000,
+) -> list[sqlite3.Row]:
+    """按 rowid 水位线增量读取格子表新增行。
+
+    格子表用 INSERT ... ON CONFLICT DO UPDATE：重见只更新 last_seen_tick，
+    rowid 不变；新发现的格子才拿新 rowid，因此 rowid 是无空洞的水位线
+    （first_seen_tick 做水位线会在同 tick 多行被 LIMIT 截断时丢数据）。
+    返回行含 rowid 列，调用方以最后一行的 rowid 推进水位线；
+    返回数量小于 limit 表示已追平。
+    """
+    if table not in MAP_CELL_TABLES:
+        raise ValueError(f"unknown map cell table: {table}")
+    with closing(_connect(path, read_only=True)) as connection:
+        return connection.execute(
+            f"""
+            SELECT rowid, x, y, first_seen_tick, last_seen_tick FROM {table}
+            WHERE rowid > ? ORDER BY rowid LIMIT ?
+            """,
+            (after_rowid, limit),
+        ).fetchall()
+
+
 def read_overview(
     path: Path,
     *,
     tick: int | None = None,
     since_tick: int | None = None,
     include_history: bool = True,
+    include_cell_history: bool = True,
 ) -> dict[str, object]:
     if not path.is_file():
         return {"available": False, "ticks": []}
@@ -1202,7 +1279,7 @@ def read_overview(
                 """,
                 (selected_tick, history_start),
             ).fetchall()
-            if include_history
+            if include_history and include_cell_history
             else []
         )
         obstacles = (
@@ -1213,7 +1290,7 @@ def read_overview(
                 """,
                 (selected_tick, history_start),
             ).fetchall()
-            if include_history
+            if include_history and include_cell_history
             else []
         )
         resources = (
@@ -1224,7 +1301,7 @@ def read_overview(
                 """,
                 (selected_tick, history_start),
             ).fetchall()
-            if include_history
+            if include_history and include_cell_history
             else []
         )
         enemy_cores = connection.execute(
