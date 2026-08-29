@@ -4,13 +4,15 @@ const canvas = document.querySelector("#map");
 const context = canvas.getContext("2d", { alpha: false });
 const MAP_CHUNK_SIZE = 32;
 const MAP_LAYERS = ["explored", "obstacles", "resource_history"];
+const ACCOUNT_STALE_TICKS = 3;
 const ui = {
-  tick: document.querySelector("#metric-tick"),
-  resources: document.querySelector("#metric-resources"),
-  population: document.querySelector("#metric-population"),
-  force: document.querySelector("#metric-force"),
-  posture: document.querySelector("#metric-posture"),
-  enemies: document.querySelector("#metric-enemies"),
+  accountStatus: document.querySelector("#account-status"),
+  tick: document.querySelector("#status-tick"),
+  resources: document.querySelector("#status-resources"),
+  population: document.querySelector("#status-population"),
+  force: document.querySelector("#status-force"),
+  posture: document.querySelector("#status-posture"),
+  enemies: document.querySelector("#status-enemies"),
   status: document.querySelector("#map-status"),
   slider: document.querySelector("#tick-slider"),
   play: document.querySelector("#toggle-play"),
@@ -23,7 +25,7 @@ const ui = {
   losses: document.querySelector("#loss-list"),
   revenge: document.querySelector("#revenge-list"),
   orders: document.querySelector("#order-list"),
-  unitList: document.querySelector("#order-unit-list"),
+  orderUnitList: document.querySelector("#order-unit-list"),
   orderForm: document.querySelector("#order-form"),
   orderStatus: document.querySelector("#order-status"),
   orderSelectionMode: document.querySelector("#order-selection-mode"),
@@ -36,12 +38,22 @@ const ui = {
   hoverTooltip: document.querySelector("#hover-tooltip"),
   productionForm: document.querySelector("#production-form"),
   productionStatus: document.querySelector("#production-status"),
+  panelToggle: document.querySelector("#panel-toggle"),
+  mapZoomIn: document.querySelector("#map-zoom-in"),
+  mapZoomOut: document.querySelector("#map-zoom-out"),
+  mapZoomHome: document.querySelector("#map-zoom-home"),
+  unitsPanel: document.querySelector("#units-panel"),
+  unitsPanelContainer: document.querySelector("#units-panel-container"),
+  unitsPanelToggle: document.querySelector("#units-panel-toggle"),
+  unitList: document.querySelector("#unit-list"),
   allianceForm: document.querySelector("#alliance-form"),
   allianceStatus: document.querySelector("#alliance-status"),
   expeditionForm: document.querySelector("#expedition-form"),
   expeditionStatus: document.querySelector("#expedition-status"),
   expeditionList: document.querySelector("#expedition-list"),
   pickExpeditionTarget: document.querySelector("#pick-expedition-target"),
+  controlAccountChip: document.querySelector("#control-account-chip"),
+  productionAccountChip: document.querySelector("#production-account-chip"),
 };
 
 const colors = {
@@ -52,7 +64,7 @@ const colors = {
   resource: "#40cc87",
   resourceHistory: "#b88f24",
   friendly: "#3db8e3",
-  ally: "#ffb7c5",
+  ally: "#b8a1ff",
   enemy: "#ee6268",
   oldCore: "#873f44",
   beacon: "#f0c84c",
@@ -67,6 +79,7 @@ const state = {
   kills: null,
   orders: [],
   controlUnits: [],
+  selectedAccount: null, // null = 大号；否则为小号用户名
   rankingKey: "damage_dealt",
   live: true,
   playing: false,
@@ -83,8 +96,22 @@ const state = {
   pickMode: null,
   viewport: { width: 1, height: 1 },
   mapIndex: Object.fromEntries(MAP_LAYERS.map((name) => [name, new Map()])),
+  // 底图增量状态：cellKeys 按坐标去重（主/副库拼接会有重复行），
+  // mapVersion 对齐服务端缓存版本；viewTick 非空时绘制按 first_seen 过滤
+  cellKeys: Object.fromEntries(MAP_LAYERS.map((name) => [name, new Set()])),
+  mapVersion: null,
+  mapLoading: false,
+  exploredCount: 0,
+  viewTick: null,
   unitFilter: "ALL",
   useRelativeCoords: false,
+  panelVisible: true,
+  unitsPanelVisible: true,
+  legendVisible: true,
+  flashTarget: null,
+  pinch: null,
+  accountCards: new Map(),
+  knownAccounts: new Map(),
 };
 // 获取己方 Core 的绝对坐标
 function getCorePosition() {
@@ -120,6 +147,7 @@ function formatCoordDisplay(worldPos) {
 }
 
 let drawFrame = 0;
+let flashFrame = 0;
 //悬停计时相关变量
 let hoverTimer = null;
 let currentHoverCell = null;
@@ -173,7 +201,7 @@ function selectUnitInForm(unit, isMultiSelect = false) {
     renderUnitPicker();
   }
 
-  const checkbox = ui.unitList.querySelector(`input[value="${unit.id}"]`);
+  const checkbox = ui.orderUnitList.querySelector(`input[value="${unit.id}"]`);
 
   if (isMultiSelect) {
     // 多选模式：累加当前单位的勾选状态
@@ -182,14 +210,14 @@ function selectUnitInForm(unit, isMultiSelect = false) {
     }
   } else {
     // 单选模式：取消其他勾选，只保留当前这 1 个单位
-    ui.unitList.querySelectorAll("input:checked").forEach((cb) => {
+    ui.orderUnitList.querySelectorAll("input:checked").forEach((cb) => {
       if (cb !== checkbox) cb.checked = false;
     });
     if (checkbox) checkbox.checked = true;
   }
 
   // 统计已选中的单位总数
-  const checkedBoxes = ui.unitList.querySelectorAll("input:checked");
+  const checkedBoxes = ui.orderUnitList.querySelectorAll("input:checked");
   document.querySelector("#order-count").value = checkedBoxes.length;
 
   setPanel("control");
@@ -209,7 +237,7 @@ function selectUnitInForm(unit, isMultiSelect = false) {
 function drawSelectedUnitsHighlight() {
   if (!state.pickingTarget) return;
   const checkedIds = new Set(
-    [...ui.unitList.querySelectorAll("input:checked")].map((input) => input.value)
+    [...ui.orderUnitList.querySelectorAll("input:checked")].map((input) => input.value)
   );
   if (!checkedIds.size) return;
 
@@ -230,8 +258,15 @@ function drawSelectedUnitsHighlight() {
   }
   context.restore();
 }
+function getPixelRatio() {
+  const dpr = window.devicePixelRatio || 1;
+  // 移动端高 DPI 设备限制为 2，降低 GPU/内存开销
+  if (window.innerWidth <= 760) return Math.min(dpr, 2);
+  return Math.max(1, dpr);
+}
+
 function resizeCanvas() {
-  const ratio = Math.max(1, window.devicePixelRatio || 1);
+  const ratio = getPixelRatio();
   const rect = canvas.getBoundingClientRect();
   state.viewport = { width: rect.width, height: rect.height };
   canvas.width = Math.max(1, Math.round(rect.width * ratio));
@@ -264,8 +299,14 @@ function visibleAt(position) {
 
 function indexCells(name, cells, reset = false) {
   const index = state.mapIndex[name];
-  if (reset) index.clear();
+  const keys = state.cellKeys[name];
+  if (reset) { index.clear(); keys.clear(); }
   cells.forEach((cell) => {
+    // 坐标去重：同一格子可能同时来自主/副库（或增量批次重叠）
+    const packed = ((cell[0] + 32768) << 16) | (cell[1] + 32768);
+    if (keys.has(packed)) return;
+    keys.add(packed);
+    if (name === "explored") state.exploredCount += 1;
     const key = `${Math.floor(cell[0] / MAP_CHUNK_SIZE)},${Math.floor(cell[1] / MAP_CHUNK_SIZE)}`;
     if (!index.has(key)) index.set(key, []);
     index.get(key).push(cell);
@@ -288,7 +329,7 @@ function drawIndexedCells(name, color, size = 1) {
 }
 
 function scheduleDraw() {
-  if (drawFrame) return;
+  if (drawFrame || flashFrame) return;
   drawFrame = requestAnimationFrame(() => {
     drawFrame = 0;
     draw();
@@ -296,6 +337,8 @@ function scheduleDraw() {
 }
 
 function drawCell(position, color, size = 1) {
+  // 回放时按发现时间本地过滤（obstacles 行无时间戳，视为始终可见）
+  if (state.viewTick != null && position.length > 2 && position[2] > state.viewTick) return;
   if (!visibleAt(position)) return;
   const [x, y] = screenPosition(position);
   const cell = Math.max(1, state.view.scale * size);
@@ -324,6 +367,26 @@ function drawGrid() {
     context.lineTo(rect.width, Math.round(sy) + 0.5);
   }
   context.stroke();
+}
+
+function drawAxes() {
+  const [originX, originY] = screenPosition([0, 0]);
+  if (
+    originX < -state.viewport.width || originX > state.viewport.width * 2 ||
+    originY < -state.viewport.height || originY > state.viewport.height * 2
+  ) {
+    return;
+  }
+  context.save();
+  context.strokeStyle = "rgba(80, 110, 125, 0.65)";
+  context.lineWidth = 1.5;
+  context.beginPath();
+  context.moveTo(0, originY);
+  context.lineTo(state.viewport.width, originY);
+  context.moveTo(originX, 0);
+  context.lineTo(originX, state.viewport.height);
+  context.stroke();
+  context.restore();
 }
 
 function drawTrail(points) {
@@ -362,11 +425,14 @@ function drawCore(item, relation, historical = false) {
   context.restore();
 }
 
-function drawUnit(item, relation) {
+function drawUnit(item, relation, historical = false) {
   const [x, y] = screenPosition(item.position);
   const radius = Math.max(2.5, state.view.scale * 0.28);
   const friendly = relation === "friendly";
   const allied = relation === "ally";
+  context.save();
+  context.globalAlpha = historical ? 0.42 : 1;
+  context.setLineDash(historical ? [3, 2] : []);
   context.fillStyle = allied ? colors.ally : friendly ? colors.friendly : colors.enemy;
   context.strokeStyle = allied ? "#ffe0e7" : friendly ? "#a8e8ff" : "#ffb0b3";
   context.lineWidth = 1;
@@ -389,6 +455,21 @@ function drawUnit(item, relation) {
   }
   context.fill();
   context.stroke();
+
+  // 携带资源的工兵添加绿色小角标
+  if (item.unit_type === "WORKER" && item.cargo > 0) {
+    const badgeRadius = Math.max(1.8, radius * 0.45);
+    const badgeX = x + radius * 0.7;
+    const badgeY = y - radius * 0.7;
+    context.beginPath();
+    context.arc(badgeX, badgeY, badgeRadius, 0, Math.PI * 2);
+    context.fillStyle = colors.resource;
+    context.fill();
+    context.strokeStyle = colors.background;
+    context.lineWidth = 0.8;
+    context.stroke();
+  }
+  context.restore();
 }
 
 function drawPlan(overview, objectById) {
@@ -429,6 +510,143 @@ function drawOrderTarget() {
   context.restore();
 }
 
+function drawFlashTarget() {
+  if (!state.flashTarget || state.flashTarget.until < Date.now()) return;
+  const position = state.flashTarget.position;
+  if (!visibleAt(position)) return;
+  const [x, y] = screenPosition(position);
+  const size = Math.max(10, state.view.scale * 0.75);
+  const elapsed = state.flashTarget.until - Date.now();
+  const alpha = Math.min(1, elapsed / 300);
+  context.save();
+  context.strokeStyle = `rgba(240, 200, 76, ${alpha})`;
+  context.lineWidth = 2;
+  context.setLineDash([4, 4]);
+  context.beginPath();
+  context.arc(x, y, size, 0, Math.PI * 2);
+  context.stroke();
+  context.restore();
+}
+
+function coordLink(x, y, label = null) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "coord-link";
+  button.textContent = label || `${x},${y}`;
+  button.dataset.coordX = x;
+  button.dataset.coordY = y;
+  button.title = `定位到 (${x}, ${y})`;
+  return button;
+}
+
+function locatePosition(position, targetScale = null) {
+  state.view.x = position[0];
+  state.view.y = position[1];
+  if (targetScale != null) {
+    state.view.scale = Math.max(1.5, Math.min(32, targetScale));
+  }
+  state.centered = false;
+  state.flashTarget = { position: [...position], until: Date.now() + 1200 };
+  updateMetrics();
+  draw();
+}
+
+function handleCoordClick(event) {
+  const link = event.target.closest(".coord-link");
+  if (!link) return;
+  const x = Number(link.dataset.coordX);
+  const y = Number(link.dataset.coordY);
+  if (Number.isSafeInteger(x) && Number.isSafeInteger(y)) {
+    locatePosition([x, y], Math.max(state.view.scale, 8));
+  }
+}
+
+function hasVisibleEnemies() {
+  const objects = state.overview?.state?.objects || [];
+  const allianceIds = new Set(state.overview?.alliance_objects?.map((item) => item.id) || []);
+  return objects.some((item) =>
+    item.controlled === false &&
+    !allianceIds.has(item.id) &&
+    item.relation !== "ALLY" &&
+    shouldDrawObject(item) &&
+    item.position,
+  );
+}
+
+function drawEnemyFlash() {
+  const objects = state.overview?.state?.objects || [];
+  const allianceIds = new Set(state.overview?.alliance_objects?.map((item) => item.id) || []);
+  const now = Date.now();
+  const pulse = (Math.sin(now / 220) + 1) / 2;
+
+  const enemies = objects.filter((item) =>
+    item.controlled === false &&
+    !allianceIds.has(item.id) &&
+    item.relation !== "ALLY" &&
+    shouldDrawObject(item) &&
+    item.position,
+  );
+  if (!enemies.length) return;
+
+  context.save();
+  for (const item of enemies) {
+    const [x, y] = screenPosition(item.position);
+    const isCore = item.kind === "CORE";
+    const baseSize = isCore
+      ? Math.max(12, state.view.scale * 0.95)
+      : Math.max(8, state.view.scale * 0.42);
+    const radius = baseSize + pulse * (isCore ? 5 : 3);
+    const alpha = 0.25 + pulse * 0.55;
+
+    context.strokeStyle = `rgba(238, 98, 104, ${alpha})`;
+    context.lineWidth = isCore ? 2.5 : 1.5;
+    context.beginPath();
+    if (isCore) {
+      const half = radius;
+      context.rect(x - half, y - half, half * 2, half * 2);
+    } else {
+      context.arc(x, y, radius, 0, Math.PI * 2);
+    }
+    context.stroke();
+  }
+  context.restore();
+}
+
+function startEnemyFlashLoop() {
+  if (flashFrame) return;
+  flashFrame = requestAnimationFrame(function loop() {
+    if (!hasVisibleEnemies()) {
+      flashFrame = 0;
+      return;
+    }
+    draw();
+    flashFrame = requestAnimationFrame(loop);
+  });
+}
+
+function drawStar(cx, cy, spikes, outerRadius, innerRadius) {
+  let rot = Math.PI / 2 * 3;
+  let x = cx;
+  let y = cy;
+  const step = Math.PI / spikes;
+
+  context.beginPath();
+  context.moveTo(cx, cy - outerRadius);
+  for (let i = 0; i < spikes; i++) {
+    x = cx + Math.cos(rot) * outerRadius;
+    y = cy + Math.sin(rot) * outerRadius;
+    context.lineTo(x, y);
+    rot += step;
+
+    x = cx + Math.cos(rot) * innerRadius;
+    y = cy + Math.sin(rot) * innerRadius;
+    context.lineTo(x, y);
+    rot += step;
+  }
+  context.lineTo(cx, cy - outerRadius);
+  context.closePath();
+}
+
 function drawRoutes(overview) {
   if (!state.layers.routes) return;
   const units = new Map(
@@ -465,6 +683,7 @@ function draw() {
   context.fillStyle = colors.background;
   context.fillRect(0, 0, rect.width, rect.height);
   drawGrid();
+  drawAxes();
   const overview = state.overview;
   if (!overview?.available) {
     context.fillStyle = "#76838b";
@@ -482,9 +701,12 @@ function draw() {
   const objects = overview.state.objects || [];
   const allianceObjects = overview.alliance_objects || [];
   const allianceIds = new Set(allianceObjects.map((item) => item.id));
-  (state.layers.history ? overview.enemy_core_history : [])
+  (state.layers.history ? overview.enemy_core_history || [] : [])
     .filter((item) => !item.currently_visible && !allianceIds.has(item.core_id))
     .forEach((item) => drawCore(item, "enemy", true));
+  (state.layers.history ? overview.enemy_unit_history || [] : [])
+    .filter((item) => !item.currently_visible && !allianceIds.has(item.id) && shouldDrawObject(item))
+    .forEach((item) => drawUnit(item, "enemy", true));
 
   const objectById = new Map();
   for (const item of objects) {
@@ -504,31 +726,41 @@ function draw() {
   }
   drawPlan(overview, objectById);
   drawRoutes(overview);
+  drawEnemyFlash();
+  startEnemyFlashLoop();
 
   const beacon = overview.state.champion_beacon;
   if (beacon?.position) {
     const [x, y] = screenPosition(beacon.position);
-    const size = Math.max(5, state.view.scale * 0.5);
+    const outer = Math.max(6, state.view.scale * 0.6);
+    const inner = outer * 0.4;
     context.fillStyle = colors.beacon;
-    context.beginPath();
-    context.moveTo(x, y - size);
-    context.lineTo(x + size, y);
-    context.lineTo(x, y + size);
-    context.lineTo(x - size, y);
-    context.closePath();
+    context.strokeStyle = "#8a6d1f";
+    context.lineWidth = 1;
+    drawStar(x, y, 5, outer, inner);
     context.fill();
+    context.stroke();
   }
   drawOrderTarget();
   drawSelectedUnitsHighlight();
+  drawFlashTarget();
 }
 
 function setTargetPicking(active, mode = "order") {
   state.pickingTarget = active;
   state.pickMode = active ? mode : null;
-  ui.pickTarget.classList.toggle("active", active);
+  ui.pickTarget.classList.toggle("active", active && mode === "order");
   ui.pickExpeditionTarget.classList.toggle("active", active && mode === "expedition");
-  ui.pickTarget.textContent = active ? "点击地图选择目标（可拖动）" : "在地图上选择目标";
+  const targetButtonText = state.orderTarget ? "隐藏地图选点" : "在地图上选择目标";
+  ui.pickTarget.textContent = active && mode === "order" ? "取消选点" : targetButtonText;
+  ui.pickExpeditionTarget.textContent = active && mode === "expedition" ? "取消选点" : targetButtonText;
   canvas.classList.toggle("picking-target", active);
+}
+
+function clearMapTarget() {
+  state.orderTarget = null;
+  setTargetPicking(false);
+  draw();
 }
 
 function fitMap() {
@@ -554,10 +786,143 @@ function controlledCore() {
 function centerMap(force = false) {
   const core = controlledCore();
   if (!core || (state.centered && !force)) return;
-  state.view.x = core.position[0];
-  state.view.y = core.position[1];
+  centerMapAt(core.position);
+}
+
+function centerMapAt(position) {
+  if (!Array.isArray(position) || position.length !== 2) return;
+  state.view.x = position[0];
+  state.view.y = position[1];
   state.centered = true;
   draw();
+}
+
+function populationCapacity(population) {
+  return Math.max(10, population * 5);
+}
+
+function accountCard(key) {
+  const existing = state.accountCards.get(key);
+  if (existing) return existing;
+  const button = document.createElement("button");
+  button.type = "button";
+  const badge = document.createElement("span");
+  badge.className = "account-badge";
+  const name = document.createElement("span");
+  name.className = "account-name";
+  const stats = document.createElement("span");
+  stats.className = "account-stats";
+  const defense = document.createElement("span");
+  defense.className = "account-defense";
+  defense.hidden = true;
+  button.append(badge, name, stats, defense);
+  const card = { button, badge, name, stats, defense, position: null };
+  button.addEventListener("click", () => {
+    // 点击账号卡片：切换信息与操作上下文，并把地图定位到该账号 Core
+    setSelectedAccount(key === "primary" ? null : state.knownAccounts.get(key));
+    if (card.position) centerMapAt(card.position);
+  });
+  state.accountCards.set(key, card);
+  return card;
+}
+
+function setSelectedAccount(username) {
+  const next = username || null;
+  if (state.selectedAccount === next) return;
+  state.selectedAccount = next;
+  updateAccountChips();
+  renderAccountStatus(state.overview?.accounts || []);
+  updateMetrics();
+  renderUnitList();
+  refreshControl();
+}
+
+function updateAccountChips() {
+  const label = state.selectedAccount
+    ? `操作目标：@${state.selectedAccount}`
+    : "操作目标：大号";
+  if (ui.controlAccountChip) ui.controlAccountChip.textContent = label;
+  if (ui.productionAccountChip) ui.productionAccountChip.textContent = label;
+}
+
+function urlWithAccount(url) {
+  if (!state.selectedAccount) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}account=${encodeURIComponent(state.selectedAccount)}`;
+}
+
+function selectedAccountSummary() {
+  if (!state.selectedAccount) return null;
+  return (
+    (state.overview?.accounts || []).find(
+      (account) => account.role === "secondary" && account.username === state.selectedAccount,
+    ) || null
+  );
+}
+
+function renderAccountStatus(accounts) {
+  const seen = new Set();
+  const liveTick = accounts.reduce(
+    (highest, account) => Math.max(highest, account.tick),
+    state.overview?.tick ?? 0,
+  );
+  accounts.forEach((account) => {
+    const key = account.role === "primary" ? "primary" : `secondary:${account.username}`;
+    seen.add(key);
+    if (account.username) state.knownAccounts.set(key, account.username);
+    const card = accountCard(key);
+    const lag = state.live ? Math.max(0, liveTick - account.tick) : 0;
+    const stale = lag > ACCOUNT_STALE_TICKS;
+    const username = account.username ? `@${account.username}` : "未识别";
+    card.position = account.core_position;
+    // 队友防御状态来自共享联盟目录；主号自身态势已在顶部指标卡展示
+    const peerCore = (state.overview?.alliance_objects || []).find(
+      (item) => item.kind === "CORE" && item.owner_username === account.username,
+    );
+    const defenseInfo = peerCore?.defense || null;
+    const underAttack = Boolean(defenseInfo?.under_attack);
+    card.defense.hidden = !defenseInfo;
+    card.defense.textContent = underAttack
+      ? "求援"
+      : String(defenseInfo?.threat_level || "").toLowerCase();
+    card.defense.className = `account-defense${underAttack ? " urgent" : ""}`;
+    const active =
+      key === "primary" ? state.selectedAccount === null : state.selectedAccount === account.username;
+    card.button.className = `account-summary ${account.role}${stale ? " stale" : ""}${
+      active ? " active" : ""
+    }${underAttack ? " under-attack" : ""}`;
+    card.button.title = `${username} · Tick ${account.tick}${stale ? ` · 落后 ${lag} tick` : ""}${
+      defenseInfo ? ` · 态势 ${defenseInfo.posture || "?"}` : ""
+    } · 点击切换到该账号${
+      account.core_position ? "并定位 Core" : ""
+    }`;
+    card.badge.textContent = account.role === "primary" ? "主" : "小";
+    card.name.textContent = username;
+    card.stats.textContent = `资源 ${account.resources}/${populationCapacity(account.population)} · 人口 ${
+      account.population
+    } · ${account.workers}W ${account.vanguards}V ${account.rangers}R${stale ? ` · 落后 ${lag}` : ""}`;
+  });
+  // 小号数据来自另一实例的历史库，掉线时整条会消失；保留占位以免状态条突然抖动。
+  state.knownAccounts.forEach((username, key) => {
+    if (seen.has(key)) return;
+    const card = accountCard(key);
+    const role = key === "primary" ? "primary" : "secondary";
+    card.position = null;
+    card.defense.hidden = true;
+    const active =
+      role === "primary" ? state.selectedAccount === null : state.selectedAccount === username;
+    card.button.className = `account-summary ${role} offline${active ? " active" : ""}`;
+    card.button.title = `@${username} · 离线 · 点击可查看其排队中的调兵与配置`;
+    card.badge.textContent = role === "primary" ? "主" : "小";
+    card.name.textContent = `@${username}`;
+    card.stats.textContent = "离线";
+  });
+  const ordered = [...state.accountCards.entries()]
+    .sort(([a], [b]) => (a === "primary" ? -1 : b === "primary" ? 1 : a.localeCompare(b)))
+    .map(([, card]) => card.button);
+  if (ordered.some((button, index) => ui.accountStatus.children[index] !== button)) {
+    ui.accountStatus.replaceChildren(...ordered);
+  }
 }
 
 function updateMetrics() {
@@ -571,14 +936,21 @@ function updateMetrics() {
   const enemies = Number.isInteger(overview.enemy_count)
     ? overview.enemy_count
     : game.objects.filter((item) => item.controlled === false && item.relation !== "ALLY").length;
-  ui.tick.textContent = overview.tick;
-  ui.resources.textContent = `${game.resources}/${Math.max(10, game.population * 5)}`;
-  ui.population.textContent = game.population;
-  ui.force.textContent = `${workers}W ${vanguards}V ${rangers}R`;
+  renderAccountStatus(overview.accounts || []);
+  // 选中小号时，资源/人口/兵力/Tick 展示该账号自己的摘要数据
+  const selected = selectedAccountSummary();
+  ui.tick.textContent = selected ? selected.tick : overview.tick;
+  ui.resources.textContent = selected
+    ? `${selected.resources}/${populationCapacity(selected.population)}`
+    : `${game.resources}/${populationCapacity(game.population)}`;
+  ui.population.textContent = selected ? selected.population : game.population;
+  ui.force.textContent = selected
+    ? `${selected.workers}W ${selected.vanguards}V ${selected.rangers}R`
+    : `${workers}W ${vanguards}V ${rangers}R`;
   ui.posture.textContent = overview.strategy.phase || overview.strategy.posture || "--";
   ui.enemies.textContent = enemies;
   const mode = state.live ? "实时" : "历史";
-  ui.status.textContent = `${mode} · 已探索 ${overview.explored.length} · 历史 Core ${overview.enemy_core_history.length} · 缩放 ${state.view.scale.toFixed(1)}`;
+  ui.status.textContent = `${mode} · 已探索 ${state.exploredCount} · 历史 Core ${(overview.enemy_core_history || []).length} · 缩放 ${state.view.scale.toFixed(1)}`;
 }
 
 function eventClass(type) {
@@ -604,9 +976,17 @@ function renderEvents() {
     tick.textContent = `t${event.tick}`;
     const text = document.createElement("span");
     text.className = eventClass(event.event_type);
-    const position = event.position ? ` @ ${event.position[0]},${event.position[1]}` : "";
-    const reason = event.reason_code ? ` / ${event.reason_code}` : "";
-    text.textContent = `${event.event_type}${reason}${position}`;
+    text.append(event.event_type);
+    if (event.reason_code) {
+      const reason = document.createElement("span");
+      reason.textContent = ` / ${event.reason_code}`;
+      text.append(reason);
+    }
+    if (event.position) {
+      const at = document.createElement("span");
+      at.textContent = " @ ";
+      text.append(at, coordLink(event.position[0], event.position[1]));
+    }
     item.append(tick, text);
     ui.events.append(item);
   });
@@ -675,9 +1055,11 @@ function renderControl() {
   } else {
     recentKills.forEach((kill) => {
       const item = document.createElement("li");
-      const position = Array.isArray(kill.position) ? ` @ ${kill.position[0]},${kill.position[1]}` : "";
       const username = kill.username ? ` @${kill.username}` : "";
-      item.textContent = `t${kill.tick} ${kill.kind === "CORE" ? "Core" : "单位"}${username}${position}`;
+      item.append(`t${kill.tick} ${kill.kind === "CORE" ? "Core" : "单位"}${username}`);
+      if (Array.isArray(kill.position)) {
+        item.append(" @ ", coordLink(kill.position[0], kill.position[1]));
+      }
       ui.kills.append(item);
     });
   }
@@ -690,10 +1072,12 @@ function renderControl() {
       item.className = "empty-state";
       item.textContent = "暂无受击记录";
     } else {
-      const position = Array.isArray(loss.position) ? ` @ ${loss.position[0]},${loss.position[1]}` : "";
       const result = loss.outcome === "DESTROYED" ? "摧毁" : "攻击";
       const attacker = loss.username ? `被 @${loss.username} ${result}` : `${result}者身份未公开`;
-      item.textContent = `t${loss.tick} ${loss.kind === "CORE" ? "Core" : "单位"} ${attacker}${position}`;
+      item.append(`t${loss.tick} ${loss.kind === "CORE" ? "Core" : "单位"} ${attacker}`);
+      if (Array.isArray(loss.position)) {
+        item.append(" @ ", coordLink(loss.position[0], loss.position[1]));
+      }
     }
     ui.losses.append(item);
   });
@@ -725,7 +1109,9 @@ function renderControl() {
         ? order.unit_ids.map((id) => id.slice(0, 8)).join(", ")
         : "旧订单未指定单位";
       const summary = document.createElement("span");
-      summary.textContent = `#${order.id} ${order.unit_type} x${order.unit_count} → (${order.target_x},${order.target_y}) / ${order.status} / ${unitIds}`;
+      summary.append(`#${order.id} ${order.unit_type} x${order.unit_count} → (`);
+      summary.append(coordLink(order.target_x, order.target_y, `${order.target_x},${order.target_y}`));
+      summary.append(`) / ${order.status} / ${unitIds}`);
       item.append(summary);
       if (order.status === "PENDING") {
         const cancel = document.createElement("button");
@@ -753,7 +1139,9 @@ function renderExpeditions() {
     } else {
       item.className = "order-item";
       const summary = document.createElement("span");
-      summary.textContent = `${expedition.enabled ? "启用" : "暂停"} · ${expedition.name} · ${expedition.ranger_count}R ${expedition.vanguard_count}V → (${expedition.target_x},${expedition.target_y})`;
+      summary.append(`${expedition.enabled ? "启用" : "暂停"} · ${expedition.name} · ${expedition.ranger_count}R ${expedition.vanguard_count}V → (`);
+      summary.append(coordLink(expedition.target_x, expedition.target_y, `${expedition.target_x},${expedition.target_y}`));
+      summary.append(")");
       const edit = document.createElement("button");
       edit.type = "button"; edit.dataset.editExpedition = expedition.id; edit.textContent = "编辑";
       const remove = document.createElement("button");
@@ -761,6 +1149,108 @@ function renderExpeditions() {
       item.append(summary, edit, remove);
     }
     ui.expeditionList.append(item);
+  });
+}
+
+const UNIT_TYPE_ORDER = { CORE: 0, WORKER: 1, VANGUARD: 2, RANGER: 3 };
+const UNIT_TYPE_NAMES = { WORKER: "工人", VANGUARD: "先锋", RANGER: "游侠" };
+
+function formatUnitLabel(unit) {
+  if (unit.kind === "CORE") return "Core";
+  return `${UNIT_TYPE_NAMES[unit.unit_type] || unit.unit_type || "单位"} ${unit.id.slice(0, 8)}`;
+}
+
+function formatUnitAction(action) {
+  if (!action) return "—";
+  if (action.type === "MOVE" && action.direction) {
+    const labels = { UP: "上", DOWN: "下", LEFT: "左", RIGHT: "右" };
+    return `移动${labels[action.direction] || action.direction}`;
+  }
+  if (action.type === "ATTACK") return "攻击";
+  if (action.type === "GATHER") return "采集";
+  if (action.type === "RETURN") return "返程";
+  if (action.type === "IDLE") return "待机";
+  return action.type;
+}
+
+function setUnitFilter(filter) {
+  state.unitFilter = filter;
+  document.querySelectorAll("[data-unit-filter]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.unitFilter === filter);
+  });
+  draw();
+  renderUnitList();
+}
+
+function renderUnitList() {
+  if (!ui.unitList) return;
+  ui.unitList.replaceChildren();
+  // 选中小号时，单位列表改用联盟共享状态里该账号的单位（大号视角下它们不是 controlled）
+  const objects = state.selectedAccount
+    ? (state.overview?.alliance_objects || []).filter(
+        (item) => item.owner_username === state.selectedAccount,
+      )
+    : state.overview?.state?.objects || [];
+  const actions = state.overview?.plan?.unit_actions || {};
+  const units = objects
+    .filter((item) =>
+      state.selectedAccount
+        ? ["CORE", "UNIT"].includes(item.kind)
+        : item.controlled === true && ["CORE", "UNIT"].includes(item.kind),
+    )
+    .sort((left, right) => {
+      const leftKind = left.kind === "CORE" ? "CORE" : left.unit_type;
+      const rightKind = right.kind === "CORE" ? "CORE" : right.unit_type;
+      // 注意用 ?? 而非 ||：CORE 的序号是 0，|| 会把 0 当成缺失值回退到 99，导致 Core 沉底
+      const orderDiff = (UNIT_TYPE_ORDER[leftKind] ?? 99) - (UNIT_TYPE_ORDER[rightKind] ?? 99);
+      if (orderDiff !== 0) return orderDiff;
+      return String(left.id).localeCompare(String(right.id));
+    });
+
+  const filtered = units.filter((item) => shouldDrawObject(item));
+
+  if (!filtered.length) {
+    const empty = document.createElement("li");
+    empty.className = "empty-state";
+    empty.textContent = "当前没有可显示的单位";
+    empty.style.cursor = "default";
+    ui.unitList.append(empty);
+    return;
+  }
+
+  filtered.forEach((unit) => {
+    const item = document.createElement("li");
+    if (unit.kind === "CORE") item.classList.add("core");
+    item.dataset.unitId = unit.id;
+
+    const iconCell = document.createElement("div");
+    iconCell.className = "unit-icon";
+    const shape = document.createElement("span");
+    shape.className = "shape";
+    if (unit.kind === "CORE") shape.classList.add("core");
+    else if (unit.unit_type === "WORKER") shape.classList.add("worker");
+    else if (unit.unit_type === "VANGUARD") shape.classList.add("vanguard");
+    else if (unit.unit_type === "RANGER") shape.classList.add("ranger");
+    iconCell.append(shape);
+
+    const info = document.createElement("div");
+    info.className = "unit-info";
+    const idSpan = document.createElement("span");
+    idSpan.className = "unit-id";
+    idSpan.textContent = formatUnitLabel(unit);
+    item.title = unit.id;
+    const meta = document.createElement("span");
+    meta.className = "unit-meta";
+    const cargo = unit.kind === "UNIT" && unit.unit_type === "WORKER" && unit.cargo > 0 ? ` · 载货${unit.cargo}` : "";
+    meta.textContent = `(${unit.position[0]}, ${unit.position[1]}) · HP ${unit.hp}${cargo}`;
+    info.append(idSpan, meta);
+
+    const action = document.createElement("span");
+    action.className = "unit-action";
+    action.textContent = formatUnitAction(actions[unit.id]);
+
+    item.append(iconCell, info, action);
+    ui.unitList.append(item);
   });
 }
 
@@ -775,7 +1265,7 @@ function renderUnitPicker() {
   const core = state.controlUnits.find((unit) => unit.kind === "CORE");
   const minDistance = Math.max(0, Number(ui.orderMinDistance.value) || 0);
   const selectedIds = new Set(
-    [...ui.unitList.querySelectorAll("input:checked")].map((input) => input.value),
+    [...ui.orderUnitList.querySelectorAll("input:checked")].map((input) => input.value),
   );
   const units = state.controlUnits
     .filter((unit) => (
@@ -784,13 +1274,13 @@ function renderUnitPicker() {
         : unit.kind === "UNIT" && unit.unit_type === selectedType
     ))
     .sort((left, right) => left.id.localeCompare(right.id));
-  ui.unitList.replaceChildren();
+  ui.orderUnitList.replaceChildren();
   ui.orderDistanceField.classList.toggle("hidden", selectionMode !== "DISTANT");
   if (!units.length) {
     const empty = document.createElement("span");
     empty.className = "empty-state";
     empty.textContent = `当前没有可派遣的 ${selectedType}`;
-    ui.unitList.append(empty);
+    ui.orderUnitList.append(empty);
   } else {
     units.forEach((unit) => {
       const label = document.createElement("label");
@@ -808,10 +1298,10 @@ function renderUnitPicker() {
       const text = document.createElement("span");
       text.textContent = `${unit.id.slice(0, 8)} / (${unit.position[0]},${unit.position[1]}) / HP ${unit.hp}${cargo}${distance}`;
       label.append(checkbox, text);
-      ui.unitList.append(label);
+      ui.orderUnitList.append(label);
     });
   }
-  document.querySelector("#order-count").value = ui.unitList.querySelectorAll("input:checked").length;
+  document.querySelector("#order-count").value = ui.orderUnitList.querySelectorAll("input:checked").length;
 }
 
 async function fetchJson(url) {
@@ -821,28 +1311,66 @@ async function fetchJson(url) {
 }
 
 async function loadOverview(tick = null) {
-  const incremental = tick === null && state.live && state.overview?.available;
-  const query = tick !== null
-    ? `?tick=${encodeURIComponent(tick)}`
-    : incremental ? `?since_tick=${encodeURIComponent(state.overview.tick)}` : "";
-  const overview = await fetchJson(`/api/overview${query}`);
-  if (overview.history_delta && state.overview?.available) {
-    for (const name of MAP_LAYERS) {
-      indexCells(name, overview[name]);
-      state.overview[name].push(...overview[name]);
-      overview[name] = state.overview[name];
+  // 地图图层已移交 /api/map-base 后台缓存，overview 只承载轻量状态（<1MB）。
+  // 在途时直接跳过，避免轮询叠加出请求风暴（下个周期会自动补上）
+  if (state.overviewLoading) return;
+  state.overviewLoading = true;
+  try {
+    const query = tick !== null ? `?tick=${encodeURIComponent(tick)}&history=0` : "";
+    const overview = await fetchJson(`/api/overview${query}`);
+    state.overview = overview;
+    // viewTick=null 表示实时；回放时绘制按格子的 first_seen 本地过滤
+    state.viewTick = tick;
+    if (overview.available) {
+      centerMap(false);
+      updateMetrics();
+      renderEvents();
+      renderRanking();
+      renderUnitList();
+      await refreshMapBase(overview.map_version);
+      draw();
     }
-  } else {
-    for (const name of MAP_LAYERS) indexCells(name, overview[name] || [], true);
+  } finally {
+    state.overviewLoading = false;
   }
-  state.overview = overview;
-  if (state.overview.available) {
-    centerMap(false);
-    updateMetrics();
-    renderEvents();
-    renderRanking();
+}
+
+async function refreshMapBase(serverVersion = null) {
+  const target = serverVersion ?? state.overview?.map_version;
+  if (!state.overview?.available || target == null || state.mapLoading) return;
+  if (target === state.mapVersion) return;
+  state.mapLoading = true;
+  try {
+    const query = state.mapVersion != null
+      ? `?version=${encodeURIComponent(state.mapVersion)}`
+      : "";
+    const response = await fetch(`/api/map-base${query}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    const contentType = response.headers.get("Content-Type") || "";
+    if (contentType.startsWith("application/json")) {
+      // building：缓存首轮构建中，下个周期重试
+      await response.json();
+      return;
+    }
+    const headerVersion = Number(response.headers.get("X-Map-Version"));
+    const text = await response.text();
+    let changed = false;
+    for (const line of text.split("\n")) {
+      if (!line) continue;
+      const entry = JSON.parse(line);
+      indexCells(entry.l, entry.r);
+      changed = true;
+    }
+    if (Number.isFinite(headerVersion)) state.mapVersion = headerVersion;
+    if (changed) {
+      updateMetrics();
+      draw();
+    }
+  } catch (error) {
+    ui.status.textContent = `底图接口错误 · ${error.message}`;
+  } finally {
+    state.mapLoading = false;
   }
-  draw();
 }
 
 async function refreshTicks() {
@@ -856,6 +1384,7 @@ async function refreshTicks() {
       ui.slider.value = Math.max(0, state.selectedIndex);
       const latest = state.ticks.at(-1)?.tick;
       if (latest !== previousLatest || !state.overview) await loadOverview();
+      else void refreshMapBase(); // 底图缓存可能在轮询间隙追平了新格子
     }
   } catch (error) {
     ui.status.textContent = `历史接口错误 · ${error.message}`;
@@ -874,19 +1403,30 @@ async function refreshLeaderboard() {
 
 async function refreshControl() {
   try {
+    // 选中小号时，战果/调兵/配置都按该账号的历史库读取
     const [kills, orders, overview, controlConfig] = await Promise.all([
-      fetchJson("/api/kills"),
-      fetchJson("/api/orders"),
+      fetchJson(urlWithAccount("/api/kills")),
+      fetchJson(urlWithAccount("/api/orders")),
       fetchJson("/api/overview?history=0"),
-      fetchJson("/api/control-config"),
+      fetchJson(urlWithAccount("/api/control-config")),
     ]);
     state.kills = kills;
     state.orders = orders || [];
     state.controlConfig = controlConfig;
-    state.controlUnits = (overview.state?.objects || []).filter(
-      (item) => ["CORE", "UNIT"].includes(item.kind) && item.controlled === true,
-    );
+    if (state.selectedAccount) {
+      // 手动派遣的单位选择器同样切换到该账号（数据来自联盟共享状态）
+      state.controlUnits = (overview.alliance_objects || []).filter(
+        (item) =>
+          ["CORE", "UNIT"].includes(item.kind) &&
+          item.owner_username === state.selectedAccount,
+      );
+    } else {
+      state.controlUnits = (overview.state?.objects || []).filter(
+        (item) => ["CORE", "UNIT"].includes(item.kind) && item.controlled === true,
+      );
+    }
     renderControl();
+    renderUnitList();
     const production = controlConfig.production;
     if (production && document.activeElement?.form !== ui.productionForm) {
       document.querySelector("#production-worker").value = production.worker_weight;
@@ -895,7 +1435,9 @@ async function refreshControl() {
     }
     const alliance = controlConfig.alliance;
     if (alliance && document.activeElement?.form !== ui.allianceForm) {
+      document.querySelector("#alliance-rally-enabled").checked = alliance.rally_enabled;
       document.querySelector("#alliance-rally-radius").value = alliance.rally_radius;
+      document.querySelector("#alliance-defense-enabled").checked = alliance.defense_enabled !== false;
     }
   } catch (error) {
     ui.orderStatus.textContent = `调兵接口错误 · ${error.message}`;
@@ -932,7 +1474,7 @@ function togglePlay() {
 }
 
 function setPanel(name) {
-  ["events", "ranking", "control"].forEach((item) => {
+  ["status", "ranking", "control"].forEach((item) => {
     const active = item === name;
     document.querySelector(`#${item}-tab`).classList.toggle("active", active);
     document.querySelector(`#${item}-tab`).setAttribute("aria-selected", active);
@@ -1010,22 +1552,55 @@ canvas.addEventListener("pointerup", (event) => {
   }
 });
 canvas.addEventListener("wheel", (event) => {
-  clearHover(); 
+  clearHover();
   event.preventDefault();
   state.view.scale = Math.max(1.5, Math.min(32, state.view.scale * (event.deltaY < 0 ? 1.14 : 0.88)));
   updateMetrics();
   scheduleDraw();
 }, { passive: false });
 
+// 移动端双指缩放
+canvas.addEventListener("touchstart", (event) => {
+  if (event.touches.length === 2) {
+    event.preventDefault();
+    const dx = event.touches[0].clientX - event.touches[1].clientX;
+    const dy = event.touches[0].clientY - event.touches[1].clientY;
+    state.pinch = {
+      startDistance: Math.hypot(dx, dy),
+      startScale: state.view.scale,
+      center: [
+        (event.touches[0].clientX + event.touches[1].clientX) / 2,
+        (event.touches[0].clientY + event.touches[1].clientY) / 2,
+      ],
+    };
+  }
+}, { passive: false });
+
+canvas.addEventListener("touchmove", (event) => {
+  if (event.touches.length === 2 && state.pinch) {
+    event.preventDefault();
+    const dx = event.touches[0].clientX - event.touches[1].clientX;
+    const dy = event.touches[0].clientY - event.touches[1].clientY;
+    const distance = Math.hypot(dx, dy);
+    const ratio = distance / state.pinch.startDistance;
+    const newScale = Math.max(1.5, Math.min(32, state.pinch.startScale * ratio));
+    state.view.scale = newScale;
+    updateMetrics();
+    scheduleDraw();
+  }
+}, { passive: false });
+
+canvas.addEventListener("touchend", () => {
+  state.pinch = null;
+});
+
+canvas.addEventListener("touchcancel", () => {
+  state.pinch = null;
+});
+
 // 兵种筛选按钮切换监听
 document.querySelectorAll("[data-unit-filter]").forEach((button) => {
-  button.addEventListener("click", () => {
-    state.unitFilter = button.dataset.unitFilter;
-    document.querySelectorAll("[data-unit-filter]").forEach((btn) => {
-      btn.classList.toggle("active", btn === button);
-    });
-    draw();
-  });
+  button.addEventListener("click", () => setUnitFilter(button.dataset.unitFilter));
 });
 document.querySelector("#previous-tick").addEventListener("click", () => selectIndex(state.selectedIndex - 1));
 document.querySelector("#next-tick").addEventListener("click", () => selectIndex(state.selectedIndex + 1));
@@ -1034,8 +1609,26 @@ document.querySelector("#live-tick").addEventListener("click", () => selectIndex
 document.querySelector("#center-map").addEventListener("click", () => centerMap(true));
 document.querySelector("#zoom-in").addEventListener("click", () => { state.view.scale = Math.min(32, state.view.scale * 1.25); updateMetrics(); draw(); });
 document.querySelector("#zoom-out").addEventListener("click", () => { state.view.scale = Math.max(1.5, state.view.scale * 0.8); updateMetrics(); draw(); });
+ui.mapZoomIn.addEventListener("click", () => { state.view.scale = Math.min(32, state.view.scale * 1.25); updateMetrics(); draw(); });
+ui.mapZoomOut.addEventListener("click", () => { state.view.scale = Math.max(1.5, state.view.scale * 0.8); updateMetrics(); draw(); });
+ui.mapZoomHome.addEventListener("click", () => centerMap(true));
+ui.panelToggle.addEventListener("click", () => {
+  state.panelVisible = !state.panelVisible;
+  document.body.classList.toggle("panel-hidden", !state.panelVisible);
+  const title = state.panelVisible ? "隐藏右侧情报面板" : "显示右侧情报面板";
+  ui.panelToggle.title = title;
+  ui.panelToggle.setAttribute("aria-label", title);
+});
+ui.unitsPanelToggle.addEventListener("click", () => {
+  state.unitsPanelVisible = !state.unitsPanelVisible;
+  ui.unitsPanelContainer.classList.toggle("hidden", !state.unitsPanelVisible);
+  ui.unitsPanelToggle.textContent = state.unitsPanelVisible ? "‹" : "›";
+  const title = state.unitsPanelVisible ? "隐藏单位列表" : "显示单位列表";
+  ui.unitsPanelToggle.title = title;
+  ui.unitsPanelToggle.setAttribute("aria-label", title);
+});
 ui.slider.addEventListener("input", () => selectIndex(Number(ui.slider.value)));
-document.querySelector("#events-tab").addEventListener("click", () => setPanel("events"));
+document.querySelector("#status-tab").addEventListener("click", () => setPanel("status"));
 document.querySelector("#ranking-tab").addEventListener("click", () => setPanel("ranking"));
 document.querySelector("#control-tab").addEventListener("click", () => setPanel("control"));
 document.querySelectorAll(".ranking-mode").forEach((button) => button.addEventListener("click", () => {
@@ -1044,23 +1637,37 @@ document.querySelectorAll(".ranking-mode").forEach((button) => button.addEventLi
   renderRanking();
 }));
 document.querySelector("#fit-map").addEventListener("click", fitMap);
-document.querySelector("#home-map").addEventListener("click", () => centerMap(true));
 document.querySelectorAll("[data-map-layer]").forEach((input) => input.addEventListener("change", () => {
   state.layers[input.dataset.mapLayer] = input.checked;
+  // 图例条目即图层开关：关闭时整行置灰
+  input.closest(".legend-item")?.classList.toggle("layer-off", !input.checked);
   draw();
 }));
-ui.pickTarget.addEventListener("click", () => setTargetPicking(!state.pickingTarget, "order"));
-ui.pickExpeditionTarget.addEventListener("click", () => setTargetPicking(!state.pickingTarget, "expedition"));
+ui.pickTarget.addEventListener("click", () => {
+  if (state.orderTarget || (state.pickingTarget && state.pickMode === "order")) {
+    clearMapTarget();
+    return;
+  }
+  setTargetPicking(true, "order");
+});
+ui.pickExpeditionTarget.addEventListener("click", () => {
+  if (state.orderTarget || (state.pickingTarget && state.pickMode === "expedition")) {
+    clearMapTarget();
+    return;
+  }
+  setTargetPicking(true, "expedition");
+});
 [ui.orderX, ui.orderY].forEach((input) => input.addEventListener("change", () => {
   const position = [Number(ui.orderX.value), Number(ui.orderY.value)];
   state.orderTarget = position.every(Number.isSafeInteger) ? position : null;
+  setTargetPicking(false);
   draw();
 }));
 
 ui.orderForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   ui.orderStatus.textContent = "提交中…";
-  const unitIds = [...ui.unitList.querySelectorAll("input:checked")].map((input) => input.value);
+  const unitIds = [...ui.orderUnitList.querySelectorAll("input:checked")].map((input) => input.value);
   if (!unitIds.length) {
     ui.orderStatus.textContent = "请先选择具体核心或至少一个具体单位";
     return;
@@ -1075,6 +1682,7 @@ ui.orderForm.addEventListener("submit", async (event) => {
     target_x: absPos[0], // 发给后端的永远是真实的绝对坐标
     target_y: absPos[1],
   };
+  if (state.selectedAccount) payload.account = state.selectedAccount;
   try {
     const response = await fetch("/api/orders", {
       method: "POST",
@@ -1083,7 +1691,9 @@ ui.orderForm.addEventListener("submit", async (event) => {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.message || result.error || response.statusText);
-    ui.orderStatus.textContent = `已提交 #${result.id}，将在下个 Tick 调整动作`;
+    ui.orderStatus.textContent = state.selectedAccount
+      ? `已提交给 @${state.selectedAccount} #${result.id}，将在下个 Tick 调整动作`
+      : `已提交 #${result.id}，将在下个 Tick 调整动作`;
     setTargetPicking(false);
     await refreshControl();
   } catch (error) {
@@ -1096,17 +1706,17 @@ ui.orderSelectionMode.addEventListener("change", renderUnitPicker);
 ui.orderMinDistance.addEventListener("input", () => {
   if (ui.orderSelectionMode.value === "DISTANT") renderUnitPicker();
 });
-ui.unitList.addEventListener("change", () => {
+ui.orderUnitList.addEventListener("change", () => {
   ui.orderSelectionMode.value = "MANUAL";
   ui.orderDistanceField.classList.add("hidden");
-  document.querySelector("#order-count").value = ui.unitList.querySelectorAll("input:checked").length;
+  document.querySelector("#order-count").value = ui.orderUnitList.querySelectorAll("input:checked").length;
 });
 ui.orders.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-cancel-order]");
   if (!button) return;
   button.disabled = true;
   try {
-    const response = await fetch(`/api/orders/${encodeURIComponent(button.dataset.cancelOrder)}`, {
+    const response = await fetch(urlWithAccount(`/api/orders/${encodeURIComponent(button.dataset.cancelOrder)}`), {
       method: "DELETE",
     });
     const result = await response.json();
@@ -1144,13 +1754,16 @@ ui.productionForm.addEventListener("submit", async (event) => {
     vanguard_weight: Number(document.querySelector("#production-vanguard").value),
     ranger_weight: Number(document.querySelector("#production-ranger").value),
   };
+  if (state.selectedAccount) payload.account = state.selectedAccount;
   try {
     const response = await fetch("/api/control-config", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.message || response.statusText);
-    ui.productionStatus.textContent = "生产比例已保存，将在下个 Tick 生效";
+    ui.productionStatus.textContent = state.selectedAccount
+      ? `@${state.selectedAccount} 的生产比例已保存，将在下个 Tick 生效`
+      : "生产比例已保存，将在下个 Tick 生效";
     await refreshControl();
   } catch (error) {
     ui.productionStatus.textContent = `保存失败 · ${error.message}`;
@@ -1160,7 +1773,9 @@ ui.productionForm.addEventListener("submit", async (event) => {
 ui.allianceForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const payload = {
+    rally_enabled: document.querySelector("#alliance-rally-enabled").checked,
     rally_radius: Number(document.querySelector("#alliance-rally-radius").value),
+    defense_enabled: document.querySelector("#alliance-defense-enabled").checked,
   };
   try {
     const response = await fetch("/api/alliance-config", {
@@ -1168,7 +1783,13 @@ ui.allianceForm.addEventListener("submit", async (event) => {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.message || response.statusText);
-    ui.allianceStatus.textContent = `靠拢距离已设为 ${result.rally_radius} 格，将在下个 Tick 生效`;
+    const rallyText = result.rally_enabled
+      ? `联盟靠拢已开启（距离 ${result.rally_radius} 格）`
+      : "联盟靠拢已关闭";
+    const defenseText = result.defense_enabled === false
+      ? "防御支援已关闭"
+      : "防御支援已开启";
+    ui.allianceStatus.textContent = `${rallyText} · ${defenseText}，将在下个 Tick 生效`;
     await refreshControl();
   } catch (error) {
     ui.allianceStatus.textContent = `保存失败 · ${error.message}`;
@@ -1193,13 +1814,16 @@ ui.expeditionForm.addEventListener("submit", async (event) => {
     target_y: absPos[1],
     enabled: document.querySelector("#expedition-enabled").checked,
   };
+  if (state.selectedAccount) payload.account = state.selectedAccount;
   try {
     const response = await fetch("/api/expeditions", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.message || response.statusText);
-    ui.expeditionStatus.textContent = "远征队已保存，将在下个 Tick 生效";
+    ui.expeditionStatus.textContent = state.selectedAccount
+      ? `@${state.selectedAccount} 的远征队已保存，将在下个 Tick 生效`
+      : "远征队已保存，将在下个 Tick 生效";
     document.querySelector("#expedition-id").value = "";
     await refreshControl();
   } catch (error) {
@@ -1224,7 +1848,7 @@ ui.expeditionList.addEventListener("click", async (event) => {
   }
   if (!remove) return;
   try {
-    const response = await fetch(`/api/expeditions/${encodeURIComponent(remove.dataset.deleteExpedition)}`, { method: "DELETE" });
+    const response = await fetch(urlWithAccount(`/api/expeditions/${encodeURIComponent(remove.dataset.deleteExpedition)}`), { method: "DELETE" });
     const result = await response.json();
     if (!response.ok) throw new Error(result.message || response.statusText);
     await refreshControl();
@@ -1233,13 +1857,45 @@ ui.expeditionList.addEventListener("click", async (event) => {
   }
 });
 
+[ui.events, ui.kills, ui.losses, ui.orders, ui.expeditionList].forEach((list) => {
+  list.addEventListener("click", handleCoordClick);
+});
+
+ui.unitList.addEventListener("click", (event) => {
+  const item = event.target.closest("li[data-unit-id]");
+  if (!item) return;
+  const unitId = item.dataset.unitId;
+  const sources = [
+    ...(state.overview?.state?.objects || []),
+    ...(state.overview?.alliance_objects || []),
+  ];
+  const unit = sources.find((obj) => obj.id === unitId && obj.position);
+  if (!unit) return;
+  locatePosition(unit.position, Math.max(state.view.scale, 10));
+});
+
 new ResizeObserver(resizeCanvas).observe(canvas);
+updateAccountChips();
 refreshTicks();
 refreshLeaderboard();
 refreshControl();
 setInterval(refreshTicks, 5000);
 setInterval(refreshLeaderboard, 15000);
 setInterval(refreshControl, 5000);
+
+// 移动端初始化：默认收起两侧面板，给地图留出更多空间
+if (window.innerWidth <= 760) {
+  state.panelVisible = false;
+  document.body.classList.add("panel-hidden");
+  ui.panelToggle.title = "显示右侧情报面板";
+  ui.panelToggle.setAttribute("aria-label", "显示右侧情报面板");
+
+  state.unitsPanelVisible = false;
+  ui.unitsPanelContainer.classList.add("hidden");
+  ui.unitsPanelToggle.textContent = "›";
+  ui.unitsPanelToggle.title = "显示单位列表";
+  ui.unitsPanelToggle.setAttribute("aria-label", "显示单位列表");
+}
 
 let isAllCollapsed = false;
 
@@ -1271,8 +1927,26 @@ document.querySelector("#control-panel")?.addEventListener("click", (event) => {
   }
 });
 
+function setLegendVisible(visible) {
+  state.legendVisible = visible;
+  document.body.classList.toggle("legend-hidden", !visible);
+  const checkbox = document.querySelector("#toggle-legend");
+  if (checkbox) checkbox.checked = visible;
+  const btn = document.querySelector("#legend-toggle");
+  if (btn) btn.classList.toggle("inactive", !visible);
+}
+
 // 相对坐标模式开关监听
 document.querySelector("#toggle-relative-coord")?.addEventListener("change", (event) => {
   state.useRelativeCoords = event.target.checked;
   draw();
+});
+
+// 图例显示开关监听
+document.querySelector("#toggle-legend")?.addEventListener("change", (event) => {
+  setLegendVisible(event.target.checked);
+});
+
+document.querySelector("#legend-toggle")?.addEventListener("click", () => {
+  setLegendVisible(!state.legendVisible);
 });
